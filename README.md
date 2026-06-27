@@ -64,8 +64,8 @@ Journal abbreviations are primarily resolved from `container-title` values.
 
 Lookup order is:
 
-1. Primary jurisdiction data (`data/primary-us.json`) for the current jurisdiction chain.
-2. Secondary journal table (`data/secondary-us-bluebook.json`).
+1. Primary jurisdiction data (`juris-abbrevs/primary-us.json`) for the current jurisdiction chain.
+2. Secondary journal table (`juris-abbrevs/secondary-us-bluebook.json`).
 3. User journal overrides saved from the Preferences panel.
 4. Fallback word-based abbreviation logic when no table hit is found.
 
@@ -87,7 +87,7 @@ Pane location and assets:
 The panel supports two working modes via dataset selection:
 
 - Journals mode (`journals:secondary-us-bluebook`)
-- Jurisdiction mode (`primary-us`, `auto-us`, `juris-us-map`)
+- Jurisdiction mode (`juris-abbrevs/primary-us`, `juris-abbrevs/auto-us`, `juris-maps/juris-us-map`)
 
 ### What You Can Do In The Panel
 
@@ -152,6 +152,21 @@ Optional custom output base name:
 ./package-xpi.ps1 -OutputBaseName "my-build-name"
 ```
 
+### Refresh Jurisdiction Assets
+
+Use this when you want to normalize or refresh the Juris-M-style dataset folders:
+
+```powershell
+./scripts/sync-juris-assets.ps1
+```
+
+The script copies the canonical jurisdiction datasets into:
+
+- `juris-abbrevs/`
+- `juris-maps/`
+
+It accepts a `-SourceRoot` argument if you want to mirror the files from another checkout.
+
 ### PowerShell Execution Policy Note
 
 If script execution is blocked, run with a process-scoped bypass:
@@ -167,6 +182,9 @@ Install the generated `.xpi` in Zotero's add-ons UI.
 ## Project Files
 
 - `style-modules/` contains CSL-M IndigoTemp modules.
-- `data/` contains abbreviation and jurisdiction datasets.
+- `juris-abbrevs/` contains abbreviation datasets.
+- `juris-maps/` contains jurisdiction datasets.
+- `data/` remains as a compatibility fallback for older path references.
 - `lib/` contains source modules.
+- `scripts/sync-juris-assets.ps1` keeps the folder layout aligned with Juris-M-style sources.
 - `content/indigobook-cslm.js` is the bundled runtime script loaded by `bootstrap.js`.

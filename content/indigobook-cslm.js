@@ -32,12 +32,12 @@ var IndigoBookCSLM = (() => {
     }
     async init() {
       await Promise.all([
-        this.loadJSON("data/auto-us.json").catch(() => null),
-        this.loadJSON("data/juris-us-map.json").catch(() => null),
-        this.loadJSON("data/primary-jurisdictions.json").catch(() => null),
-        this.loadJSON("data/primary-us.json").catch(() => null),
-        this.loadJSON("data/secondary-us-bluebook.json").catch(() => null),
-        this.loadJSON("data/secondary-science.json").catch(() => null),
+        this.loadJSONAny(["juris-abbrevs/auto-us.json", "data/auto-us.json"]),
+        this.loadJSONAny(["juris-maps/juris-us-map.json", "data/juris-us-map.json"]),
+        this.loadJSONAny(["juris-maps/primary-jurisdictions.json", "data/primary-jurisdictions.json"]),
+        this.loadJSONAny(["juris-abbrevs/primary-us.json", "data/primary-us.json"]),
+        this.loadJSONAny(["juris-abbrevs/secondary-us-bluebook.json", "data/secondary-us-bluebook.json"]),
+        this.loadJSONAny(["juris-abbrevs/secondary-science.json", "data/secondary-science.json"]),
         this.loadJSON("style-modules/index.json").catch(() => null)
       ]);
     }
@@ -55,6 +55,28 @@ var IndigoBookCSLM = (() => {
       const obj = JSON.parse(text);
       this.cache.set(relPath, obj);
       return obj;
+    }
+    async loadTextAny(relPaths) {
+      const paths = Array.isArray(relPaths) ? relPaths : [relPaths];
+      for (const relPath of paths) {
+        if (!relPath) continue;
+        try {
+          return await this.loadText(relPath);
+        } catch (error) {
+        }
+      }
+      return null;
+    }
+    async loadJSONAny(relPaths) {
+      const paths = Array.isArray(relPaths) ? relPaths : [relPaths];
+      for (const relPath of paths) {
+        if (!relPath) continue;
+        try {
+          return await this.loadJSON(relPath);
+        } catch (error) {
+        }
+      }
+      return null;
     }
   };
 
@@ -422,14 +444,14 @@ ${mlzBlock}` : mlzBlock;
       this._jurisdictionOverridesPref = "extensions.indigobook-cslm.jurisdictionOverrides";
     }
     async preload() {
-      this._autoUS = await this.dataStore.loadJSON("data/auto-us.json");
-      this._primaryUS = await this.dataStore.loadJSON("data/primary-us.json");
+      this._autoUS = await this.dataStore.loadJSONAny(["juris-abbrevs/auto-us.json", "data/auto-us.json"]);
+      this._primaryUS = await this.dataStore.loadJSONAny(["juris-abbrevs/primary-us.json", "data/primary-us.json"]);
       this._secondaryDatasets = {
-        "secondary-us-bluebook": await this.dataStore.loadJSON("data/secondary-us-bluebook.json"),
-        "secondary-science": await this.dataStore.loadJSON("data/secondary-science.json").catch(() => null)
+        "secondary-us-bluebook": await this.dataStore.loadJSONAny(["juris-abbrevs/secondary-us-bluebook.json", "data/secondary-us-bluebook.json"]),
+        "secondary-science": await this.dataStore.loadJSONAny(["juris-abbrevs/secondary-science.json", "data/secondary-science.json"])
       };
-      this._jurisUSMap = await this.dataStore.loadJSON("data/juris-us-map.json");
-      this._primaryJur = await this.dataStore.loadJSON("data/primary-jurisdictions.json");
+      this._jurisUSMap = await this.dataStore.loadJSONAny(["juris-maps/juris-us-map.json", "data/juris-us-map.json"]);
+      this._primaryJur = await this.dataStore.loadJSONAny(["juris-maps/primary-jurisdictions.json", "data/primary-jurisdictions.json"]);
       this._userSecondaryOverrides = this._loadSecondaryOverrides();
       this._userJurisdictionOverrides = this._loadJurisdictionOverrides();
     }
@@ -2494,7 +2516,10 @@ ${mlzBlock}` : mlzBlock;
       this._config = null;
     }
     async preload() {
-      this._config = await this.dataStore.loadJSON("data/case-jurisdiction-map.json").catch(() => null);
+      this._config = await this.dataStore.loadJSONAny([
+        "juris-maps/case-jurisdiction-map.json",
+        "data/case-jurisdiction-map.json"
+      ]);
     }
     mapCaseCourt(rawCourt) {
       const source = String(rawCourt || "").trim();

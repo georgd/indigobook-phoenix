@@ -66,6 +66,7 @@ $filesToArchive = Get-ChildItem -Path $sourcePath -File -Recurse -Force |
 
         # Exclude VCS dir and output artifacts
         if ($rel -match '^(\.git[\\/]|\.git$)') { return $false }
+        if ($rel -match '^(jurism-zotero[\\/]|_old_versions[\\/])') { return $false }
         if ($rel -ieq $zipName -or $rel -ieq $xpiName) { return $false }
 
         # Exclude script helpers from package
