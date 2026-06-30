@@ -34,6 +34,7 @@ var IndigoBookCSLM = (() => {
       await Promise.all([
         this.loadJSON("style-modules/index.json").catch(() => null),
         this.loadJSON("juris-abbrevs/DIRECTORY_LISTING.json").catch(() => null),
+        this.loadJSON("juris-maps/DIRECTORY_LISTING.json").catch(() => null),
         this.loadJSON("juris-maps/versions.json").catch(() => null),
         this.loadJSON("juris-maps/primary-jurisdictions.json").catch(() => null)
       ]);
@@ -545,19 +546,27 @@ ${mlzBlock}` : mlzBlock;
       const fileMetaByName = new Map(
         listingEntries.map((item) => [String(item?.filename || "").trim(), String(item?.name || "").trim()]).filter(([filename]) => Boolean(filename))
       );
+      const mapListing = await this.dataStore.loadJSONAny(["juris-maps/DIRECTORY_LISTING.json"]);
+      const mapListingEntries = Array.isArray(mapListing) ? mapListing : [];
+      const mapFileMetaByName = new Map(
+        mapListingEntries.map((item) => [String(item?.filename || "").trim(), String(item?.name || "").trim()]).filter(([filename]) => Boolean(filename))
+      );
       const autoFiles = fileNames.filter((file) => /^auto-.*\.json$/i.test(file));
-      this._autoDatasets = await this._loadDatasetGroup("juris-abbrevs", autoFiles);
+      this._autoDatasets = await this._loadDatasetGroup("juris-abbrevs", autoFiles, fileMetaByName);
       this._autoDatasetsByRoot = this._groupDatasetsByRoot(this._autoDatasets);
       this._defaultAutoDataset = this._pickLocaleDataset(Array.from(this._autoDatasets.keys()), "auto") || null;
       this._autoUS = this._defaultAutoDataset ? this._autoDatasets.get(this._defaultAutoDataset)?.data || null : null;
       this._defaultJurisdiction = this._jurisdictionRootFromFilename(this._defaultAutoDataset) || this._defaultJurisdiction;
       const primaryFiles = fileNames.filter((file) => /^primary-.*\.json$/i.test(file));
-      this._primaryDatasets = await this._loadDatasetGroup("juris-abbrevs", primaryFiles);
+      this._primaryDatasets = await this._loadDatasetGroup("juris-abbrevs", primaryFiles, fileMetaByName);
       this._primaryDatasetsByRoot = this._groupDatasetsByRoot(this._primaryDatasets);
       this._defaultPrimaryDataset = this._primaryDatasets.has("primary-us") ? "primary-us" : Array.from(this._primaryDatasets.keys())[0] || null;
       this._primaryUS = this._defaultPrimaryDataset ? this._primaryDatasets.get(this._defaultPrimaryDataset)?.data || null : null;
-      const mapFiles = fileNames.filter((file) => /^juris-.*-map\.json$/i.test(file));
-      this._mapDatasets = await this._loadDatasetGroup("juris-maps", mapFiles);
+      const mapFiles = Array.from(/* @__PURE__ */ new Set([
+        ...mapListingEntries.map((item) => String(item?.filename || "").trim()).filter((file) => /^juris-.*-map\.json$/i.test(file)),
+        ...fileNames.filter((file) => /^juris-.*-map\.json$/i.test(file))
+      ])).sort((a, b) => a.localeCompare(b));
+      this._mapDatasets = await this._loadDatasetGroup("juris-maps", mapFiles, mapFileMetaByName);
       this._mapDatasetsByRoot = this._groupDatasetsByRoot(this._mapDatasets);
       this._defaultMapDataset = this._mapDatasets.has("juris-us-map") ? "juris-us-map" : Array.from(this._mapDatasets.keys())[0] || null;
       this._jurisUSMap = this._defaultMapDataset ? this._mapDatasets.get(this._defaultMapDataset)?.data || null : null;
@@ -593,7 +602,7 @@ ${mlzBlock}` : mlzBlock;
       }
       return candidates;
     }
-    async _loadDatasetGroup(rootDir, fileNames) {
+    async _loadDatasetGroup(rootDir, fileNames, metaByFileName = /* @__PURE__ */ new Map()) {
       const datasets = /* @__PURE__ */ new Map();
       const files = Array.isArray(fileNames) ? fileNames.slice().sort((a, b) => a.localeCompare(b)) : [];
       for (const file of files) {
@@ -603,11 +612,33 @@ ${mlzBlock}` : mlzBlock;
           dataset,
           fileName: file,
           root: this._jurisdictionRootFromFilename(file),
-          name: String(data?.name || dataset).trim(),
+          name: String(metaByFileName.get(file) || this._inferDatasetDisplayName(dataset, data)).trim(),
           data
         });
       }
       return datasets;
+    }
+    _inferDatasetDisplayName(dataset, data) {
+      const explicitName = String(data?.name || "").trim();
+      if (explicitName) return explicitName;
+      const localizedJurisdictions = this._getLocalizedMapJurisdictions(data);
+      if (Array.isArray(localizedJurisdictions)) {
+        for (const item of localizedJurisdictions) {
+          if (!Array.isArray(item) || item.length < 2) continue;
+          const label = String(item[1] || "").trim();
+          if (label) return label;
+        }
+      }
+      return this._formatDatasetLabel(dataset);
+    }
+    _getLocalizedMapJurisdictions(mapData) {
+      const jurisdictions = mapData?.jurisdictions;
+      if (!jurisdictions || typeof jurisdictions !== "object" || Array.isArray(jurisdictions)) return null;
+      for (const candidate of this._localeCandidates || []) {
+        const rows = jurisdictions?.[candidate];
+        if (Array.isArray(rows) && rows.length) return rows;
+      }
+      return Array.isArray(jurisdictions?.default) ? jurisdictions.default : null;
     }
     _groupDatasetsByRoot(datasets) {
       const byRoot = /* @__PURE__ */ new Map();
@@ -664,6 +695,14 @@ ${mlzBlock}` : mlzBlock;
         return this._defaultJurisdiction || "us";
       }
       return jurisdiction.split(":")[0] || (this._defaultJurisdiction || "us");
+    }
+    _jurisdictionMapCode(rawJurisdiction) {
+      const jurisdiction = String(rawJurisdiction || "").trim().toLowerCase();
+      if (!jurisdiction || jurisdiction === "default") {
+        return this._defaultJurisdiction || "us";
+      }
+      const parts = jurisdiction.split(":").filter(Boolean);
+      return parts[parts.length - 1] || (this._defaultJurisdiction || "us");
     }
     _pickDatasetInfoForRoot(byRoot, root, fallbackDatasetName = null) {
       const normalizedRoot = String(root || "").trim().toLowerCase();
@@ -824,21 +863,94 @@ ${mlzBlock}` : mlzBlock;
         };
       }).sort((a, b) => a.label.localeCompare(b.label) || a.code.localeCompare(b.code));
     }
+    listJurisdictionMenuOptions() {
+      const rows = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const info of this._autoDatasets.values()) {
+        const place = info?.data?.xdata?.default?.place;
+        if (!place || typeof place !== "object" || Array.isArray(place)) continue;
+        for (const [rawCode, rawLabel] of Object.entries(place)) {
+          const code = String(rawCode || "").trim().toLowerCase().replace(/\+/g, ":");
+          if (!code || seen.has(code)) continue;
+          seen.add(code);
+          const display = this.formatJurisdictionDisplay(code) || String(rawLabel || "").trim() || code;
+          const parts = this._buildJurisdictionDisplayParts(code, info);
+          rows.push({
+            code,
+            label: display,
+            root: parts?.root || code.split(":")[0] || code,
+            rootLabel: parts?.rootLabel || display,
+            depth: parts?.depth || code.split(":").filter(Boolean).length
+          });
+        }
+      }
+      return rows.sort((a, b) => {
+        return a.rootLabel.localeCompare(b.rootLabel) || a.root.localeCompare(b.root) || a.depth - b.depth || a.label.localeCompare(b.label) || a.code.localeCompare(b.code);
+      });
+    }
+    listCourtOptionsForJurisdiction(rawJurisdiction) {
+      const mapInfo = this._getMapDatasetInfoForJurisdiction(rawJurisdiction) || { data: this._jurisUSMap };
+      const mapData = mapInfo?.data || null;
+      const mapJurisdiction = this._jurisdictionMapCode(rawJurisdiction);
+      const selectionJurisdiction = String(rawJurisdiction || this._defaultJurisdiction || "us").trim().toLowerCase();
+      const jurisdictions = this._getLocalizedMapJurisdictions(mapData);
+      const courts = Array.isArray(mapData?.courts) ? mapData.courts : [];
+      const row = Array.isArray(jurisdictions) ? jurisdictions.find((item) => Array.isArray(item) && String(item[0] || "").trim().toLowerCase() === mapJurisdiction) : null;
+      if (!row || !courts.length) {
+        return this.listInstitutionPartOptionsForJurisdictionTree(rawJurisdiction);
+      }
+      const rows = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const ref of row.slice(2)) {
+        const index = Number(ref);
+        if (!Number.isFinite(index) || index < 0 || index >= courts.length) continue;
+        const court = courts[index];
+        if (!Array.isArray(court) || court.length < 2) continue;
+        const key = this.normalizeKey(court[0]);
+        const label = String(court[1] ?? "").trim();
+        if (!key || !label || seen.has(key)) continue;
+        seen.add(key);
+        rows.push({
+          key,
+          label,
+          abbreviation: court[0] || "",
+          jurisdiction: selectionJurisdiction,
+          isChild: false
+        });
+      }
+      return rows.sort((a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key));
+    }
     formatJurisdictionDisplay(rawJurisdiction) {
       const jurisdiction = (rawJurisdiction || "").toString().trim().toLowerCase();
       if (!jurisdiction) return "";
+      const parts = this._buildJurisdictionDisplayParts(jurisdiction);
+      if (!parts?.labels?.length) return "";
+      return parts.labels.join("|");
+    }
+    _buildJurisdictionDisplayParts(rawJurisdiction, rawAutoInfo = null) {
+      const jurisdiction = (rawJurisdiction || "").toString().trim().toLowerCase();
+      if (!jurisdiction) return null;
       const parts = jurisdiction.split(":").filter(Boolean);
-      if (!parts.length) return "";
-      const autoInfo = this._getAutoDatasetInfoForJurisdiction(jurisdiction) || { data: this._autoUS };
-      const rootCode = parts[0].toUpperCase();
-      const labels = [String(autoInfo?.data?.name || rootCode).trim(), rootCode];
-      let chain = rootCode.toLowerCase();
+      if (!parts.length) return null;
+      const autoInfo = rawAutoInfo || this._getAutoDatasetInfoForJurisdiction(jurisdiction) || { data: this._autoUS };
+      const rootCode = parts[0].toLowerCase();
+      const rootLabel = String(
+        autoInfo?.data?.name || this._lookupJurisdictionPlaceLabel(rootCode, autoInfo) || parts[0]
+      ).trim();
+      const labels = [rootLabel || parts[0].toUpperCase()];
+      let chain = rootCode;
       for (let index = 1; index < parts.length; index += 1) {
         chain = `${chain}:${parts[index]}`;
-        const label = this._lookupJurisdictionPlaceLabel(chain, autoInfo) || parts[index].toUpperCase();
+        const label = this._lookupJurisdictionPlaceLabel(chain, autoInfo) || parts[index].replace(/\./g, " ");
         labels.push(this._normalizeJurisdictionDisplayLabel(chain, label));
       }
-      return labels.join("|");
+      return {
+        code: jurisdiction,
+        root: rootCode,
+        rootLabel: labels[0],
+        labels,
+        depth: parts.length
+      };
     }
     listInstitutionPartOptionsForJurisdiction(rawJurisdiction) {
       const jurisdiction = (rawJurisdiction || this._defaultJurisdiction || "us").toString().trim().toLowerCase() || "us";
@@ -1091,7 +1203,6 @@ ${mlzBlock}` : mlzBlock;
       return null;
     }
     _normalizeJurisdictionDisplayLabel(jurisdiction, label) {
-      if ((jurisdiction || "").toLowerCase() === "us") return "US";
       return String(label || "").trim();
     }
     listSecondaryContainerTitleAbbreviations(rawDataset = this._defaultSecondaryDataset) {
@@ -1418,7 +1529,7 @@ ${mlzBlock}` : mlzBlock;
           rows.push(row);
         }
       }
-      const jurisdictions = mapData?.jurisdictions?.default;
+      const jurisdictions = this._getLocalizedMapJurisdictions(mapData);
       if (Array.isArray(jurisdictions)) {
         for (const item of jurisdictions) {
           if (!Array.isArray(item) || item.length < 2) continue;
@@ -2134,35 +2245,19 @@ ${mlzBlock}` : mlzBlock;
     }
     _buildJurisdictionMenuList(infoBox, item, currentJurisdiction, displayValue) {
       const doc = infoBox.ownerDocument;
-      const menulist = doc.createXULElement("menulist");
-      menulist.id = "itembox-field-jurisdiction-menu";
-      menulist.className = "zotero-clicky keyboard-clickable";
-      menulist.setAttribute("aria-labelledby", "itembox-field-jurisdiction-label");
-      menulist.setAttribute("fieldname", "jurisdiction");
-      menulist.setAttribute("tooltiptext", currentJurisdiction);
-      const popup = menulist.appendChild(doc.createXULElement("menupopup"));
-      const options = this._getJurisdictionOptions(currentJurisdiction);
-      for (const option of options) {
-        const menuitem = doc.createXULElement("menuitem");
-        menuitem.setAttribute("value", option.code);
-        menuitem.setAttribute("label", option.label);
-        menuitem.setAttribute("tooltiptext", option.code);
-        popup.appendChild(menuitem);
-      }
-      menulist.value = currentJurisdiction;
-      if (!menulist.selectedItem && options.length) {
-        menulist.selectedIndex = options.findIndex((option) => option.code === currentJurisdiction);
-        if (menulist.selectedIndex < 0) menulist.selectedIndex = 0;
-      }
-      if (menulist.selectedItem && displayValue) {
-        menulist.setAttribute("label", menulist.selectedItem.getAttribute("label"));
-      }
-      menulist.addEventListener("command", async () => {
-        const selectedCode = String(menulist.value || "").trim().toLowerCase();
-        if (!selectedCode) return;
-        await this._saveJurisdictionFromMenu(item, selectedCode);
+      return this._buildFilteredPickerControl(doc, {
+        fieldName: "jurisdiction",
+        inputId: "itembox-field-jurisdiction-input",
+        listId: "itembox-field-jurisdiction-list",
+        currentValue: currentJurisdiction,
+        displayValue,
+        options: this._getJurisdictionOptions(currentJurisdiction),
+        minChars: 2,
+        onSelect: async (option) => {
+          await this._saveJurisdictionFromMenu(item, option.code);
+        },
+        formatOptionText: (option) => option.label
       });
-      return menulist;
     }
     _buildCourtMenuList(infoBox, item, currentJurisdiction, currentCourtKey, displayValue) {
       const doc = infoBox.ownerDocument;
@@ -2171,9 +2266,8 @@ ${mlzBlock}` : mlzBlock;
       menulist.className = "zotero-clicky keyboard-clickable";
       menulist.setAttribute("aria-labelledby", "itembox-field-court-label");
       menulist.setAttribute("fieldname", "court");
-      menulist.setAttribute("editable", "true");
-      menulist.setAttribute("flex", "1");
       menulist.setAttribute("tooltiptext", currentCourtKey);
+      menulist.style.flex = "1";
       const popup = menulist.appendChild(doc.createXULElement("menupopup"));
       const options = this._getCourtOptions(currentJurisdiction, currentCourtKey);
       const compoundCurrentValue = `${currentJurisdiction}||${currentCourtKey}`;
@@ -2201,8 +2295,252 @@ ${mlzBlock}` : mlzBlock;
       menulist.addEventListener("change", saveCourtValue);
       return menulist;
     }
+    _buildFilteredPickerControl(doc, {
+      fieldName,
+      inputId,
+      listId,
+      currentValue,
+      displayValue,
+      options,
+      minChars = 2,
+      onSelect,
+      formatOptionText
+    }) {
+      let currentDisplayValue = String(displayValue || "");
+      let currentRawValue = String(currentValue || "");
+      const wrapper = doc.createElement("div");
+      wrapper.style.display = "flex";
+      wrapper.style.alignItems = "center";
+      wrapper.style.gap = "0";
+      wrapper.style.width = "100%";
+      wrapper.style.position = "relative";
+      if (fieldName === "jurisdiction") {
+        wrapper.style.maxWidth = "22em";
+      }
+      const input = doc.createElement("input");
+      input.id = inputId;
+      input.className = "value";
+      input.setAttribute("fieldname", fieldName);
+      input.setAttribute("aria-labelledby", `itembox-field-${fieldName}-label`);
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.style.flex = "1";
+      input.style.minWidth = "0";
+      input.value = currentDisplayValue;
+      input.title = currentRawValue;
+      input.style.boxSizing = "border-box";
+      input.style.width = "100%";
+      input.style.maxWidth = fieldName === "jurisdiction" ? "22em" : "100%";
+      input.style.whiteSpace = "nowrap";
+      input.style.overflow = "hidden";
+      input.style.textOverflow = "ellipsis";
+      const normalizedOptions = Array.isArray(options) ? options.map((option) => ({
+        ...option,
+        displayText: String(typeof formatOptionText === "function" ? formatOptionText(option) : option.label || option.code || "").trim(),
+        searchText: this._normalizeMenuSearchText(`${String(option.label || "")} ${String(option.code || "")} ${String(option.abbreviation || "")}`)
+      })).filter((option) => option.displayText) : [];
+      const popup = doc.createElement("div");
+      popup.id = listId;
+      popup.style.position = "absolute";
+      popup.style.left = "0";
+      popup.style.right = "0";
+      popup.style.top = "100%";
+      popup.style.zIndex = "2000";
+      popup.style.maxHeight = "220px";
+      popup.style.overflowY = "auto";
+      popup.style.border = "1px solid ThreeDShadow";
+      popup.style.background = "Field";
+      popup.style.color = "FieldText";
+      popup.style.display = "none";
+      popup.style.boxShadow = "0 2px 8px rgba(0,0,0,0.2)";
+      popup.style.marginTop = "2px";
+      const hidePopup = () => {
+        popup.style.display = "none";
+        while (popup.firstChild) popup.removeChild(popup.firstChild);
+      };
+      const renderOptions = () => {
+        const query = this._normalizeMenuSearchText(String(input.value || ""));
+        hidePopup();
+        if (query.length < Math.max(1, Number(minChars) || 2)) return;
+        const matches = normalizedOptions.filter((option) => option.searchText.includes(query));
+        if (!matches.length) {
+          const empty = doc.createElement("div");
+          empty.textContent = "No matches";
+          empty.style.padding = "4px 8px";
+          empty.style.opacity = "0.7";
+          popup.appendChild(empty);
+          popup.style.display = "block";
+          return;
+        }
+        for (const option of matches.slice(0, 100)) {
+          const row = doc.createElement("button");
+          row.type = "button";
+          row.textContent = option.displayText;
+          row.title = option.code;
+          row.style.display = "block";
+          row.style.width = "100%";
+          row.style.boxSizing = "border-box";
+          row.style.textAlign = "left";
+          row.style.padding = "4px 8px";
+          row.style.border = "0";
+          row.style.margin = "0";
+          row.style.background = "transparent";
+          row.style.color = "inherit";
+          row.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          });
+          row.addEventListener("click", async () => {
+            input.value = option.displayText;
+            input.title = option.code;
+            currentDisplayValue = option.displayText;
+            currentRawValue = option.code;
+            hidePopup();
+            await onSelect?.(option);
+          });
+          popup.appendChild(row);
+        }
+        popup.style.display = "block";
+      };
+      const resolveSelectedOption = async () => {
+        const raw = String(input.value || "").trim();
+        if (!raw) return;
+        const normalizedRaw = this._normalizeMenuSearchText(raw);
+        const exact = normalizedOptions.find((option) => {
+          return this._normalizeMenuSearchText(option.displayText) === normalizedRaw || this._normalizeMenuSearchText(option.code) === normalizedRaw;
+        });
+        const uniquePrefix = !exact ? normalizedOptions.filter((option) => option.searchText.includes(normalizedRaw)) : [];
+        const match = exact || (uniquePrefix.length === 1 ? uniquePrefix[0] : null);
+        if (!match) {
+          input.value = currentDisplayValue;
+          input.title = currentRawValue;
+          hidePopup();
+          return;
+        }
+        input.value = match.displayText;
+        input.title = match.code;
+        currentDisplayValue = match.displayText;
+        currentRawValue = match.code;
+        hidePopup();
+        await onSelect?.(match);
+      };
+      input.addEventListener("input", renderOptions);
+      input.addEventListener("focus", () => {
+        if (typeof input.select === "function") input.select();
+        renderOptions();
+      });
+      input.addEventListener("change", resolveSelectedOption);
+      input.addEventListener("blur", resolveSelectedOption);
+      input.addEventListener("keydown", (event) => {
+        const key = String(event.key || "");
+        if (key === "Escape") {
+          hidePopup();
+          return;
+        }
+        if (key !== "Enter") return;
+        event.preventDefault();
+        resolveSelectedOption();
+      });
+      wrapper.appendChild(input);
+      wrapper.appendChild(popup);
+      return wrapper;
+    }
+    _attachMenuSearchFilter(menulist, popup, { minChars = 2, displayValue = "" } = {}) {
+      if (!menulist || !popup) return;
+      const searchField = menulist.inputField || menulist;
+      const state = {
+        timer: null,
+        minChars: Math.max(1, Number(minChars) || 2)
+      };
+      const clearTimer = () => {
+        if (!state.timer) return;
+        clearTimeout(state.timer);
+        state.timer = null;
+      };
+      const setAllVisible = () => {
+        this._removeMenuNoResultsItem(popup);
+        for (const node of Array.from(popup.children || [])) {
+          if (node?.localName !== "menuitem") continue;
+          node.hidden = false;
+        }
+      };
+      const applyFilter = (rawQuery = "") => {
+        const normalizedQuery = this._normalizeMenuSearchText(rawQuery);
+        if (!normalizedQuery || normalizedQuery.length < state.minChars) {
+          setAllVisible();
+          return;
+        }
+        let visibleCount = 0;
+        for (const node of Array.from(popup.children || [])) {
+          if (node?.localName !== "menuitem") continue;
+          const haystack = String(node._ibcslmSearchText || node.getAttribute("label") || node.getAttribute("value") || "").trim();
+          const matches = this._normalizeMenuSearchText(haystack).includes(normalizedQuery);
+          node.hidden = !matches;
+          if (matches) visibleCount += 1;
+        }
+        if (!visibleCount) {
+          this._showMenuNoResultsItem(popup);
+          return;
+        }
+        this._removeMenuNoResultsItem(popup);
+      };
+      const resetSearch = () => {
+        clearTimer();
+        if (searchField && "value" in searchField) searchField.value = "";
+        applyFilter("");
+      };
+      const onInput = () => {
+        clearTimer();
+        const query = String(searchField?.value || "");
+        applyFilter(query);
+      };
+      const onKeyDown = (event) => {
+        if (!event || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+        if (String(event.key || "") === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          resetSearch();
+        }
+      };
+      if (searchField?.addEventListener) {
+        searchField.addEventListener("input", onInput);
+        searchField.addEventListener("keydown", onKeyDown, true);
+      } else {
+        menulist.addEventListener("keydown", onKeyDown, true);
+      }
+      popup.addEventListener("popuphidden", resetSearch);
+      popup.addEventListener("popupshown", onInput);
+      popup.addEventListener("command", resetSearch);
+      if (displayValue) {
+        menulist.setAttribute("label", displayValue);
+        if (searchField && "value" in searchField) {
+          searchField.value = "";
+        }
+      }
+      setAllVisible();
+    }
+    _normalizeMenuSearchText(value) {
+      return this.abbrevService.normalizeKey(value || "");
+    }
+    _showMenuNoResultsItem(popup) {
+      if (!popup) return;
+      this._removeMenuNoResultsItem(popup);
+      const doc = popup.ownerDocument;
+      const item = doc.createXULElement("menuitem");
+      item.setAttribute("label", "No matches");
+      item.setAttribute("disabled", "true");
+      item.hidden = false;
+      item._ibcslmNoResults = true;
+      popup.appendChild(item);
+      popup._ibcslmNoResultsItem = item;
+    }
+    _removeMenuNoResultsItem(popup) {
+      const item = popup?._ibcslmNoResultsItem;
+      if (item?.parentNode) item.parentNode.removeChild(item);
+      if (popup?._ibcslmNoResultsItem) delete popup._ibcslmNoResultsItem;
+    }
     _getJurisdictionOptions(currentJurisdiction) {
-      const options = this.abbrevService.listAutoUSPlaceJurisdictions();
+      const options = this.abbrevService.listJurisdictionMenuOptions(currentJurisdiction);
       if (!currentJurisdiction) return options;
       if (options.some((option) => option.code === currentJurisdiction)) return options;
       return [{
@@ -2242,10 +2580,21 @@ ${mlzBlock}` : mlzBlock;
         if (current === selectedCode) return;
         const extra = String(item.getField?.("extra") || "");
         const displayValue = this.abbrevService.formatJurisdictionDisplay(selectedCode);
-        const updatedExtra = this.Jurisdiction.updateMLZJurisdiction?.(extra, selectedCode, displayValue) || extra;
-        if (updatedExtra === extra) return;
-        item.setField("extra", updatedExtra);
+        let nextExtra = this.Jurisdiction.updateMLZJurisdiction?.(extra, selectedCode, displayValue) || extra;
+        nextExtra = this.Jurisdiction.updateMLZExtraField?.(nextExtra, "court", "") || nextExtra;
+        if (nextExtra === extra && String(item.getField?.("court") || "").trim() === "") return;
+        item.setField("extra", nextExtra);
+        item.setField("court", "");
         await item.saveTx({ skipDateModifiedUpdate: true });
+        try {
+          const infoBox = this._getActiveInfoBox?.();
+          if (infoBox) {
+            const courtRow = this._findInfoFieldRow(infoBox, "court");
+            if (courtRow) this._renderCourtField(infoBox);
+            this._renderCustomCourtField(infoBox);
+          }
+        } catch (e) {
+        }
         try {
           Zotero.debug(`[IndigoBook CSL-M] jurisdiction row saved: item=${String(item.id)} jurisdiction=${selectedCode}`);
         } catch (e) {
@@ -2278,6 +2627,16 @@ ${mlzBlock}` : mlzBlock;
           const displayValue = this.abbrevService.formatJurisdictionDisplay(targetJurisdiction);
           const updatedExtra = this.Jurisdiction.updateMLZJurisdiction?.(extra, targetJurisdiction, displayValue) || extra;
           item.setField("extra", updatedExtra);
+          const targetOptions = this.abbrevService.listInstitutionPartOptionsForJurisdictionTree(targetJurisdiction);
+          if (!targetOptions.length) {
+            item.setField("court", "");
+            await item.saveTx({ skipDateModifiedUpdate: true });
+            try {
+              Zotero.debug(`[IndigoBook CSL-M] court row cleared for jurisdiction with no institution-part: item=${String(item.id)} jurisdiction=${targetJurisdiction}`);
+            } catch (e) {
+            }
+            return;
+          }
         }
         item.setField("court", normalizedKey);
         await item.saveTx({ skipDateModifiedUpdate: true });

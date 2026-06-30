@@ -134,6 +134,106 @@ function Update-AbbrevDirectoryListing {
     Write-Host "Rebuilt juris-abbrevs/DIRECTORY_LISTING.json" -ForegroundColor Cyan
 }
 
+function Format-DatasetLabel {
+    param([string]$Dataset)
+
+    $value = [string]$Dataset
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return ''
+    }
+
+    $value = $value -replace '^juris-', ''
+    $value = $value -replace '-map$', ''
+    $value = $value -replace '-', ' '
+    return [System.Globalization.CultureInfo]::InvariantCulture.TextInfo.ToTitleCase($value)
+}
+
+function Get-MapDisplayName {
+    param(
+        [string]$FilePath,
+        [string]$FallbackName
+    )
+
+    try {
+        $data = Get-Content -LiteralPath $FilePath -Raw | ConvertFrom-Json
+        $name = [string]$data.name
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            return $name.Trim()
+        }
+
+        $jurisdictions = @($data.jurisdictions.default)
+        foreach ($item in $jurisdictions) {
+            $row = @($item)
+            if ($row.Count -lt 2) {
+                continue
+            }
+
+            $label = [string]$row[1]
+            if (-not [string]::IsNullOrWhiteSpace($label)) {
+                return $label.Trim()
+            }
+        }
+    } catch {
+        # Fall through to the filename-based fallback.
+    }
+
+    return $FallbackName
+}
+
+function Update-JurisMapDirectoryListing {
+    param([string]$MapRoot)
+
+    if (-not (Test-Path -LiteralPath $MapRoot)) {
+        throw "Map directory not found: $MapRoot"
+    }
+
+    $rootPath = (Resolve-Path -LiteralPath $MapRoot).Path
+    $listingPath = Join-Path -Path $rootPath -ChildPath 'DIRECTORY_LISTING.json'
+    $existingByFile = @{}
+
+    if (Test-Path -LiteralPath $listingPath) {
+        try {
+            $existing = Get-Content -LiteralPath $listingPath -Raw | ConvertFrom-Json
+            foreach ($item in @($existing)) {
+                $filename = ([string]$item.filename).Trim()
+                if (-not $filename) { continue }
+                $existingByFile[$filename] = [ordered]@{
+                    filename = $filename
+                    name = ([string]$item.name).Trim()
+                }
+            }
+        } catch {
+            Write-Warning "Could not read existing juris-maps DIRECTORY_LISTING.json; rebuilding from files."
+        }
+    }
+
+    $files = Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force |
+        ForEach-Object {
+            $relative = $_.FullName.Substring($rootPath.Length).TrimStart('\', '/')
+            $relative -replace '\\', '/'
+        } |
+        Where-Object { $_ -and ($_ -notmatch '(^|[\\/])\.') -and ($_ -match '^juris-.*-map\.json$') } |
+        Sort-Object
+
+    $entries = foreach ($file in $files) {
+        $existing = $existingByFile[$file]
+        $dataset = ([System.IO.Path]::GetFileNameWithoutExtension($file) -replace '^juris-', '' -replace '-map$', '')
+        $fallbackName = Format-DatasetLabel -Dataset $dataset
+        [ordered]@{
+            filename = $file
+            name = if ($existing -and $existing.Contains('name') -and $existing['name']) {
+                $existing['name']
+            } else {
+                Get-MapDisplayName -FilePath (Join-Path -Path $rootPath -ChildPath $file) -FallbackName $fallbackName
+            }
+        }
+    }
+
+    $payload = $entries | ConvertTo-Json -Depth 4
+    Set-Content -LiteralPath $listingPath -Value $payload -Encoding utf8
+    Write-Host "Rebuilt juris-maps/DIRECTORY_LISTING.json" -ForegroundColor Cyan
+}
+
 Update-SourceCheckout -RepoPath $sourceRoot -DirsToCheck $importDirs
 
 foreach ($importDir in $importDirs) {
@@ -173,5 +273,6 @@ foreach ($importDir in $importDirs) {
 
 Update-StyleModuleIndex -StyleModulesRoot (Join-Path -Path $repoRoot -ChildPath 'style-modules')
 Update-AbbrevDirectoryListing -AbbrevRoot (Join-Path -Path $repoRoot -ChildPath 'juris-abbrevs')
+Update-JurisMapDirectoryListing -MapRoot (Join-Path -Path $repoRoot -ChildPath 'juris-maps')
 
 Write-Host "Juris-M asset import complete." -ForegroundColor Green
