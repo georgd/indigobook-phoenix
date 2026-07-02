@@ -46,10 +46,15 @@ On item add/modify/select/render events, the plugin syncs case fields and MLZ pa
 The Zotero-facing `reporter` and `court` fields are treated as authoritative when populated. Blank fields are backfilled
 from MLZ data when available.
 
-Commenter names are stored in `Extra` -> `mlzsync1.extracreators` using Juris-M creator payloads, for example:
+For `case` items, the creator-type dropdown is extended with a plugin-managed `Commenter` option. Commenter names are stored in `Extra` -> `mlzsync1.extracreators` using Juris-M creator payloads, for example:
 
 - `{"firstName":"I.","lastName":"Karollus","creatorType":"commenter"}`
 - `{"name":"Wilhelm","creatorType":"commenter"}`
+
+The same dropdown also includes a plugin-managed `Translator` option. Translator names are stored in `Extra` -> `mlzsync1.extracreators` using Juris-M creator payloads, for example:
+
+- `{"firstName":"Jane","lastName":"Doe","creatorType":"translator"}`
+- `{"name":"Jane Doe","creatorType":"translator"}`
 
 ### Citation Pipeline Effects
 
@@ -59,6 +64,7 @@ During citeproc item retrieval, the plugin decorates CSL JSON with:
 - `country` derived from the jurisdiction root token
 - `authority` based on the Zotero `court` field (normalized)
 - `commenter` from `mlzsync1.extracreators`
+- `translator` from `mlzsync1.extracreators`
 
 This is what drives jurisdiction-specific legal style module behavior at render time.
 
