@@ -1,7 +1,7 @@
 # IndigoBook-Phoenix (Zotero 8, 9) - v0.7.0
 
-This plugin bundles US IndigoTemp jurisdiction modules and uses dynamic module loading via
-`sys.loadJurisdictionStyle(jurisdiction, variantName)` so multiple US jurisdictions can appear in one document.
+This plugin bundles Juris-M style modules and uses dynamic module loading via
+`sys.loadJurisdictionStyle(jurisdiction, variantName)` so multiple jurisdictions and module variants can appear in one document.
 
 It also patches citeproc item retrieval/abbreviation behavior and keeps case metadata synchronized with Juris-M-style
 `mlzsync1` data stored in Extra.
@@ -46,6 +46,11 @@ On item add/modify/select/render events, the plugin syncs case fields and MLZ pa
 The Zotero-facing `reporter` and `court` fields are treated as authoritative when populated. Blank fields are backfilled
 from MLZ data when available.
 
+Commenter names are stored in `Extra` -> `mlzsync1.extracreators` using Juris-M creator payloads, for example:
+
+- `{"firstName":"I.","lastName":"Karollus","creatorType":"commenter"}`
+- `{"name":"Wilhelm","creatorType":"commenter"}`
+
 ### Citation Pipeline Effects
 
 During citeproc item retrieval, the plugin decorates CSL JSON with:
@@ -53,6 +58,7 @@ During citeproc item retrieval, the plugin decorates CSL JSON with:
 - `jurisdiction` from the case item/MLZ data
 - `country` derived from the jurisdiction root token
 - `authority` based on the Zotero `court` field (normalized)
+- `commenter` from `mlzsync1.extracreators`
 
 This is what drives jurisdiction-specific legal style module behavior at render time.
 
@@ -181,6 +187,21 @@ git -C .\jurism-zotero pull --ff-only
 If you want to move the checkout to a specific upstream branch or tag, use `git checkout` in that folder first, then
 re-run the import script.
 
+### Regression Harness
+
+Use this to verify module resolution behavior after loader changes or Juris-M asset refreshes:
+
+```powershell
+node .\scripts\test-module-loader.mjs
+```
+
+The harness checks:
+
+- exact jurisdiction + exact variant resolution
+- child-to-parent fallback within a jurisdiction chain
+- fallback from variant requests to plain jurisdiction modules
+- default-root fallback for unknown jurisdictions
+
 ### PowerShell Execution Policy Note
 
 If script execution is blocked, run with a process-scoped bypass:
@@ -202,3 +223,12 @@ Install the generated `.xpi` in Zotero's add-ons UI.
 - `lib/` contains source modules.
 - `scripts/sync-juris-assets.ps1` keeps the folder layout aligned with Juris-M-style sources.
 - `content/indigobook-cslm.js` is the bundled runtime script loaded by `bootstrap.js`.
+### Lightweight Regression Harnesses
+
+Run these from the repository root with Node:
+
+- `node .\scripts\test-module-loader.mjs`
+- `node .\scripts\test-abbrev-service.mjs`
+
+The abbreviation harness also verifies domain-sensitive auto datasets such as
+French Canadian `auto-ca-fr`.

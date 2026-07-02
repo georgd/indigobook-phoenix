@@ -97,6 +97,55 @@ var IndigoBookCSLM = (() => {
         return null;
       }
     }
+    static getMLZExtraCreators(itemOrExtra) {
+      const extra = typeof itemOrExtra === "string" ? itemOrExtra : itemOrExtra?.getField?.("extra") || itemOrExtra?.extra || "";
+      const jsonText = this._extractMLZJSON(extra);
+      if (!jsonText) return [];
+      try {
+        const obj = JSON.parse(jsonText);
+        return Array.isArray(obj?.extracreators) ? obj.extracreators : [];
+      } catch (e) {
+        return [];
+      }
+    }
+    static getMLZExtraCreatorsByType(itemOrExtra, creatorType) {
+      const normalizedType = String(creatorType || "").trim().toLowerCase();
+      if (!normalizedType) return [];
+      return this.getMLZExtraCreators(itemOrExtra).filter((creator) => String(creator?.creatorType || "").trim().toLowerCase() === normalizedType).map((creator) => ({ ...creator }));
+    }
+    static updateMLZExtraCreators(itemOrExtra, creatorType, creators) {
+      const extra = typeof itemOrExtra === "string" ? itemOrExtra : itemOrExtra?.getField?.("extra") || itemOrExtra?.extra || "";
+      const normalizedType = String(creatorType || "").trim().toLowerCase();
+      if (!normalizedType) return extra;
+      const parsed = this._getMLZPayloadAndRange(extra);
+      const payload = parsed.payload || {};
+      const existingCreators = Array.isArray(payload.extracreators) ? payload.extracreators : [];
+      const retainedCreators = existingCreators.filter((creator) => {
+        return String(creator?.creatorType || "").trim().toLowerCase() !== normalizedType;
+      });
+      const incomingCreators = Array.isArray(creators) ? creators : [];
+      for (const creator of incomingCreators) {
+        const normalizedCreator = this._normalizeExtraCreator(creator, normalizedType);
+        if (normalizedCreator) retainedCreators.push(normalizedCreator);
+      }
+      if (retainedCreators.length) payload.extracreators = retainedCreators;
+      else delete payload.extracreators;
+      const hasExtraFields = payload.extrafields && typeof payload.extrafields === "object" && !Array.isArray(payload.extrafields) && Object.keys(payload.extrafields).length;
+      const hasExtraCreators = Array.isArray(payload.extracreators) && payload.extracreators.length;
+      if (!hasExtraFields && !hasExtraCreators) {
+        if (parsed.start != null && parsed.end != null) {
+          return this._removeMLZBlock(extra, parsed.start, parsed.end);
+        }
+        return extra;
+      }
+      const mlzBlock = `mlzsync1:${JSON.stringify(payload)}`;
+      if (parsed.start != null && parsed.end != null) {
+        return `${extra.slice(0, parsed.start)}${mlzBlock}${extra.slice(parsed.end)}`;
+      }
+      const base = String(extra || "").trimEnd();
+      return base ? `${base}
+${mlzBlock}` : mlzBlock;
+    }
     static getMLZJurisdiction(itemOrExtra) {
       const fields = this.getMLZExtraFields(itemOrExtra);
       const value = fields?.jurisdiction;
@@ -123,6 +172,15 @@ var IndigoBookCSLM = (() => {
       const value = fieldValue == null ? "" : String(fieldValue).trim();
       if (value) payload.extrafields[field] = value;
       else delete payload.extrafields[field];
+      if (!Object.keys(payload.extrafields).length) delete payload.extrafields;
+      const hasExtraFields = payload.extrafields && typeof payload.extrafields === "object" && !Array.isArray(payload.extrafields) && Object.keys(payload.extrafields).length;
+      const hasExtraCreators = Array.isArray(payload.extracreators) && payload.extracreators.length;
+      if (!hasExtraFields && !hasExtraCreators) {
+        if (parsed.start != null && parsed.end != null) {
+          return this._removeMLZBlock(extra, parsed.start, parsed.end);
+        }
+        return extra;
+      }
       const mlzBlock = `mlzsync1:${JSON.stringify(payload)}`;
       if (parsed.start != null && parsed.end != null) {
         return `${extra.slice(0, parsed.start)}${mlzBlock}${extra.slice(parsed.end)}`;
@@ -221,6 +279,31 @@ ${mlzBlock}` : mlzBlock;
         }
       }
       return { payload: null, start: markerIndex, end: source.length };
+    }
+    static _removeMLZBlock(extra, start, end) {
+      const source = String(extra || "");
+      const prefix = source.slice(0, start).replace(/[ \t]+\n?$/, "");
+      const suffix = source.slice(end).replace(/^\r?\n/, "");
+      const combined = `${prefix}${prefix && suffix ? "\n" : ""}${suffix}`;
+      return combined.trimEnd();
+    }
+    static _normalizeExtraCreator(creator, creatorType) {
+      if (!creator || typeof creator !== "object") return null;
+      const literalName = String(creator.name || "").trim();
+      if (literalName) {
+        return {
+          name: literalName,
+          creatorType
+        };
+      }
+      const firstName = String(creator.firstName || "").trim();
+      const lastName = String(creator.lastName || "").trim();
+      if (!firstName && !lastName) return null;
+      return {
+        firstName,
+        lastName,
+        creatorType
+      };
     }
     static _decodeLengthPrefixedJurisdiction(s) {
       if (!s || s.length < 4) return null;
@@ -380,6 +463,107 @@ ${mlzBlock}` : mlzBlock;
     }
   };
 
+  // lib/services/moduleLoader.mjs
+  var ModuleLoader = class {
+    constructor({ rootURI, dataStore, locale }) {
+      this.rootURI = rootURI;
+      this.dataStore = dataStore;
+      this.locale = locale;
+      this._defaultJurisdiction = "us";
+      this._availableFiles = [];
+      this._byFile = /* @__PURE__ */ new Map();
+      this._byJur = /* @__PURE__ */ new Map();
+      this._byModuleID = /* @__PURE__ */ new Map();
+    }
+    async preload() {
+      const idx = await this.dataStore.loadJSON("style-modules/index.json");
+      const allFiles = Array.isArray(idx?.files) ? idx.files.slice() : [];
+      this._availableFiles = allFiles.filter((file) => /\.csl$/i.test(file) && file.toLowerCase().startsWith("juris-")).sort((a, b) => a.localeCompare(b));
+      for (const file of this._availableFiles) {
+        const path = "style-modules/" + file;
+        const xml = await this.dataStore.loadText(path);
+        this._byFile.set(file, xml);
+        const info = this._parseModuleFilename(file);
+        if (!info) continue;
+        this._byModuleID.set(info.id, xml);
+        let byVariant = this._byJur.get(info.jurisdiction);
+        if (!byVariant) {
+          byVariant = /* @__PURE__ */ new Map();
+          this._byJur.set(info.jurisdiction, byVariant);
+        }
+        byVariant.set(info.variant, xml);
+      }
+      if (!this._hasModuleForJurisdiction(this._defaultJurisdiction) && this._availableFiles.length) {
+        const firstInfo = this._parseModuleFilename(this._availableFiles[0]);
+        const firstRoot = firstInfo?.jurisdiction?.split(":")[0] || "";
+        if (firstRoot && this._hasModuleForJurisdiction(firstRoot)) {
+          this._defaultJurisdiction = firstRoot;
+        }
+      }
+    }
+    _parseModuleFilename(file) {
+      const stem = String(file || "").replace(/\.csl$/i, "");
+      if (!stem.toLowerCase().startsWith("juris-")) return null;
+      const body = stem.slice(6);
+      if (!body) return null;
+      const dashIdx = body.indexOf("-");
+      const jurisdictionPart = dashIdx === -1 ? body : body.slice(0, dashIdx);
+      const variantPart = dashIdx === -1 ? "" : body.slice(dashIdx + 1);
+      if (!jurisdictionPart) return null;
+      return {
+        fileName: file,
+        id: stem,
+        jurisdiction: jurisdictionPart.toLowerCase().replace(/\+/g, ":"),
+        variant: variantPart.toLowerCase()
+      };
+    }
+    _hasModuleForJurisdiction(jurisdiction) {
+      return this._byJur.has(String(jurisdiction || "").toLowerCase());
+    }
+    hasJurisdiction(jur) {
+      return this._hasModuleForJurisdiction(jur);
+    }
+    _normalizeVariantName(variantName) {
+      return String(variantName || "").trim().toLowerCase();
+    }
+    _getJurisdictionVariantMap(jurisdiction) {
+      return this._byJur.get(String(jurisdiction || "").toLowerCase()) || null;
+    }
+    _getModuleForJurisdiction(jurisdiction, variantName = "") {
+      const byVariant = this._getJurisdictionVariantMap(jurisdiction);
+      if (!byVariant) return null;
+      const variant = this._normalizeVariantName(variantName);
+      if (variant && byVariant.has(variant)) {
+        return byVariant.get(variant);
+      }
+      if (byVariant.has("")) {
+        return byVariant.get("");
+      }
+      if (!variant && byVariant.size) {
+        return byVariant.values().next().value || null;
+      }
+      return null;
+    }
+    loadJurisdictionStyleSync(jurisdiction, variantName = "IndigoTemp") {
+      const variant = this._normalizeVariantName(variantName);
+      const jur = String(jurisdiction || this._defaultJurisdiction || "us").trim().toLowerCase() || "us";
+      const chain = Jurisdiction.trimChain(jur);
+      if (variant) {
+        for (const j of chain) {
+          const byVariant = this._getJurisdictionVariantMap(j);
+          if (byVariant?.has(variant)) {
+            return byVariant.get(variant);
+          }
+        }
+      }
+      for (const j of chain) {
+        const xml = this._getModuleForJurisdiction(j, "");
+        if (xml) return xml;
+      }
+      return this._getModuleForJurisdiction(this._defaultJurisdiction, variant) || null;
+    }
+  };
+
   // lib/services/locale.mjs
   function getLocaleCandidates(rawLocale) {
     const locale = String(rawLocale || "").trim().replace(/_/g, "-");
@@ -447,69 +631,6 @@ ${mlzBlock}` : mlzBlock;
     return [];
   }
 
-  // lib/services/moduleLoader.mjs
-  var ModuleLoader = class {
-    constructor({ rootURI, dataStore, locale }) {
-      this.rootURI = rootURI;
-      this.dataStore = dataStore;
-      this.locale = locale;
-      this._defaultJurisdiction = "us";
-      this._availableFiles = [];
-      this._byFile = /* @__PURE__ */ new Map();
-      this._byJur = /* @__PURE__ */ new Map();
-    }
-    async preload() {
-      const idx = await this.dataStore.loadJSON("style-modules/index.json");
-      const allFiles = Array.isArray(idx?.files) ? idx.files : [];
-      this._availableFiles = selectLocaleFiles(allFiles, "juris", this.locale, ".csl");
-      if (!this._availableFiles.length) {
-        this._availableFiles = allFiles.filter((file) => /\.csl$/i.test(file) && file.toLowerCase().startsWith("juris-")).sort((a, b) => a.localeCompare(b));
-      }
-      if (!this._availableFiles.length) {
-        this._availableFiles = allFiles.filter((file) => /\.csl$/i.test(file)).sort((a, b) => a.localeCompare(b));
-      }
-      for (const file of this._availableFiles) {
-        const path = "style-modules/" + file;
-        const xml = await this.dataStore.loadText(path);
-        this._byFile.set(file, xml);
-        const jur = this._jurFromFilename(file);
-        if (jur) this._byJur.set(jur, xml);
-      }
-      this._defaultJurisdiction = this._availableFiles.length ? (this._jurFromFilename(this._availableFiles[0]) || this._defaultJurisdiction).split(":")[0] || this._defaultJurisdiction : this._defaultJurisdiction;
-      if (!this._byJur.has(this._defaultJurisdiction)) {
-        const baseFile = this._availableFiles.find((f) => {
-          const jur = this._jurFromFilename(f);
-          if (!jur) return false;
-          return jur.split(":")[0] === this._defaultJurisdiction && !jur.includes(":");
-        }) || this._availableFiles.find((f) => {
-          const jur = this._jurFromFilename(f);
-          return jur && jur.split(":")[0] === this._defaultJurisdiction;
-        });
-        if (baseFile) this._byJur.set(this._defaultJurisdiction, this._byFile.get(baseFile));
-      }
-    }
-    _jurFromFilename(file) {
-      const stem = String(file || "").replace(/\.csl$/i, "");
-      if (!stem.toLowerCase().startsWith("juris-")) return null;
-      const jurisdiction = stem.slice(6).split("-")[0];
-      if (!jurisdiction) return null;
-      return jurisdiction.toLowerCase().replace(/\+/g, ":");
-    }
-    hasJurisdiction(jur) {
-      return this._byJur.has((jur || "").toLowerCase());
-    }
-    loadJurisdictionStyleSync(jurisdiction, variantName = "IndigoTemp") {
-      const variant = variantName || "IndigoTemp";
-      if (variant !== "IndigoTemp") return null;
-      let jur = (jurisdiction || this._defaultJurisdiction || "us").toLowerCase();
-      if (Jurisdiction.isCircuit(jur)) return this._byJur.get(this._defaultJurisdiction) || null;
-      for (const j of Jurisdiction.trimChain(jur)) {
-        if (this._byJur.has(j)) return this._byJur.get(j);
-      }
-      return this._byJur.get(this._defaultJurisdiction) || null;
-    }
-  };
-
   // lib/services/abbrevService.mjs
   var AbbrevService = class {
     constructor({ dataStore, locale }) {
@@ -518,6 +639,7 @@ ${mlzBlock}` : mlzBlock;
       this._localeCandidates = getLocaleCandidates(locale);
       this._autoDatasets = /* @__PURE__ */ new Map();
       this._autoDatasetsByRoot = /* @__PURE__ */ new Map();
+      this._autoDomainsByRoot = /* @__PURE__ */ new Map();
       this._primaryDatasets = /* @__PURE__ */ new Map();
       this._primaryDatasetsByRoot = /* @__PURE__ */ new Map();
       this._mapDatasets = /* @__PURE__ */ new Map();
@@ -542,10 +664,9 @@ ${mlzBlock}` : mlzBlock;
     async preload() {
       const listing = await this.dataStore.loadJSON("juris-abbrevs/DIRECTORY_LISTING.json");
       const listingEntries = Array.isArray(listing) ? listing : [];
-      const fileNames = listingEntries.map((item) => String(item?.filename || "").trim()).filter(Boolean);
-      const fileMetaByName = new Map(
-        listingEntries.map((item) => [String(item?.filename || "").trim(), String(item?.name || "").trim()]).filter(([filename]) => Boolean(filename))
-      );
+      const listingFiles = this._expandListingFiles(listingEntries);
+      const fileNames = listingFiles.map((item) => item.filename);
+      const fileMetaByName = new Map(listingFiles.map((item) => [item.filename, item.name]));
       const mapListing = await this.dataStore.loadJSONAny(["juris-maps/DIRECTORY_LISTING.json"]);
       const mapListingEntries = Array.isArray(mapListing) ? mapListing : [];
       const mapFileMetaByName = new Map(
@@ -554,6 +675,7 @@ ${mlzBlock}` : mlzBlock;
       const autoFiles = fileNames.filter((file) => /^auto-.*\.json$/i.test(file));
       this._autoDatasets = await this._loadDatasetGroup("juris-abbrevs", autoFiles, fileMetaByName);
       this._autoDatasetsByRoot = this._groupDatasetsByRoot(this._autoDatasets);
+      this._autoDomainsByRoot = this._groupDatasetDomainsByRoot(this._autoDatasets);
       this._defaultAutoDataset = this._pickLocaleDataset(Array.from(this._autoDatasets.keys()), "auto") || null;
       this._autoUS = this._defaultAutoDataset ? this._autoDatasets.get(this._defaultAutoDataset)?.data || null : null;
       this._defaultJurisdiction = this._jurisdictionRootFromFilename(this._defaultAutoDataset) || this._defaultJurisdiction;
@@ -602,6 +724,29 @@ ${mlzBlock}` : mlzBlock;
       }
       return candidates;
     }
+    _expandListingFiles(listingEntries = []) {
+      const rows = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const item of Array.isArray(listingEntries) ? listingEntries : []) {
+        const filename = String(item?.filename || "").trim();
+        const name = String(item?.name || "").trim();
+        if (filename && !seen.has(filename)) {
+          seen.add(filename);
+          rows.push({ filename, name });
+        }
+        const variants = item?.variants;
+        if (!variants || typeof variants !== "object" || Array.isArray(variants) || !filename) continue;
+        for (const variantName of Object.keys(variants)) {
+          const variant = String(variantName || "").trim();
+          if (!variant) continue;
+          const variantFile = filename.replace(/\.json$/i, `-${variant}.json`);
+          if (!variantFile || seen.has(variantFile)) continue;
+          seen.add(variantFile);
+          rows.push({ filename: variantFile, name });
+        }
+      }
+      return rows;
+    }
     async _loadDatasetGroup(rootDir, fileNames, metaByFileName = /* @__PURE__ */ new Map()) {
       const datasets = /* @__PURE__ */ new Map();
       const files = Array.isArray(fileNames) ? fileNames.slice().sort((a, b) => a.localeCompare(b)) : [];
@@ -612,6 +757,8 @@ ${mlzBlock}` : mlzBlock;
           dataset,
           fileName: file,
           root: this._jurisdictionRootFromFilename(file),
+          domain: this._datasetDomainFromFilename(file),
+          domainKey: this._normalizeDatasetDomain(this._datasetDomainFromFilename(file)),
           name: String(metaByFileName.get(file) || this._inferDatasetDisplayName(dataset, data)).trim(),
           data
         });
@@ -653,6 +800,24 @@ ${mlzBlock}` : mlzBlock;
       }
       return byRoot;
     }
+    _groupDatasetDomainsByRoot(datasets) {
+      const byRoot = /* @__PURE__ */ new Map();
+      for (const info of datasets?.values?.() || []) {
+        const root = String(info?.root || "").trim().toLowerCase();
+        const domain = String(info?.domain || "").trim();
+        const domainKey = this._normalizeDatasetDomain(domain);
+        if (!root || !domain || !domainKey) continue;
+        if (!byRoot.has(root)) byRoot.set(root, []);
+        const entries = byRoot.get(root);
+        if (!entries.some((entry) => this._normalizeDatasetDomain(entry) === domainKey)) {
+          entries.push(domain);
+        }
+      }
+      for (const entries of byRoot.values()) {
+        entries.sort((a, b) => a.localeCompare(b));
+      }
+      return byRoot;
+    }
     _pickLocaleDataset(datasetNames, prefix) {
       const names = Array.isArray(datasetNames) ? datasetNames.slice() : [];
       if (!names.length) return null;
@@ -683,32 +848,60 @@ ${mlzBlock}` : mlzBlock;
     _datasetNameFromFilename(fileName) {
       return String(fileName || "").trim().replace(/\.json$/i, "");
     }
+    _datasetBodyFromFilename(fileName) {
+      return this._datasetNameFromFilename(fileName).replace(/^auto-/i, "").replace(/^primary-/i, "").replace(/^secondary-/i, "").replace(/^juris-/i, "").replace(/-map$/i, "");
+    }
     _jurisdictionRootFromFilename(fileName) {
-      const stem = this._datasetNameFromFilename(fileName);
-      const body = stem.replace(/^auto-/i, "").replace(/^primary-/i, "").replace(/^secondary-/i, "").replace(/^juris-/i, "").replace(/-map$/i, "");
+      const body = this._datasetBodyFromFilename(fileName);
       const root = body.split("-")[0];
       return root ? root.toLowerCase().replace(/\+/g, ":") : null;
     }
+    _datasetDomainFromFilename(fileName) {
+      const body = this._datasetBodyFromFilename(fileName);
+      const dashIdx = body.indexOf("-");
+      if (dashIdx === -1) return null;
+      const domain = body.slice(dashIdx + 1).trim();
+      return domain || null;
+    }
+    _normalizeDatasetDomain(rawDomain) {
+      return String(rawDomain || "").trim().toLowerCase() || null;
+    }
+    _splitJurisdictionDomain(rawJurisdiction) {
+      const input = String(rawJurisdiction || "").trim();
+      const atIdx = input.indexOf("@");
+      const jurisdiction = (atIdx === -1 ? input : input.slice(0, atIdx)).trim().toLowerCase();
+      const domain = atIdx === -1 ? "" : input.slice(atIdx + 1).trim();
+      return {
+        jurisdiction,
+        domain,
+        domainKey: this._normalizeDatasetDomain(domain)
+      };
+    }
     _jurisdictionRoot(rawJurisdiction) {
-      const jurisdiction = String(rawJurisdiction || "").trim().toLowerCase();
+      const jurisdiction = this._splitJurisdictionDomain(rawJurisdiction).jurisdiction;
       if (!jurisdiction || jurisdiction === "default") {
         return this._defaultJurisdiction || "us";
       }
       return jurisdiction.split(":")[0] || (this._defaultJurisdiction || "us");
     }
     _jurisdictionMapCode(rawJurisdiction) {
-      const jurisdiction = String(rawJurisdiction || "").trim().toLowerCase();
+      const jurisdiction = this._splitJurisdictionDomain(rawJurisdiction).jurisdiction;
       if (!jurisdiction || jurisdiction === "default") {
         return this._defaultJurisdiction || "us";
       }
       const parts = jurisdiction.split(":").filter(Boolean);
       return parts[parts.length - 1] || (this._defaultJurisdiction || "us");
     }
-    _pickDatasetInfoForRoot(byRoot, root, fallbackDatasetName = null) {
+    _pickDatasetInfoForRoot(byRoot, root, fallbackDatasetName = null, preferredDomain = null) {
       const normalizedRoot = String(root || "").trim().toLowerCase();
       if (!normalizedRoot) return null;
       const entries = byRoot?.get?.(normalizedRoot) || [];
       if (Array.isArray(entries) && entries.length) {
+        const normalizedDomain = this._normalizeDatasetDomain(preferredDomain);
+        if (normalizedDomain) {
+          const exactDomain = entries.find((entry) => this._normalizeDatasetDomain(entry?.domain) === normalizedDomain);
+          if (exactDomain) return exactDomain;
+        }
         const fallback = String(fallbackDatasetName || "").trim().toLowerCase();
         if (fallback.startsWith("juris-") && fallback.endsWith("-map")) {
           const exactMap = entries.find((entry) => String(entry.dataset || "").toLowerCase() === `juris-${normalizedRoot}-map`);
@@ -755,8 +948,9 @@ ${mlzBlock}` : mlzBlock;
       return bucket && typeof bucket === "object" && !Array.isArray(bucket) ? bucket : {};
     }
     _getAutoDatasetInfoForJurisdiction(rawJurisdiction) {
-      const root = this._jurisdictionRoot(rawJurisdiction);
-      return this._pickDatasetInfoForRoot(this._autoDatasetsByRoot, root, this._defaultAutoDataset);
+      const parsed = this._splitJurisdictionDomain(rawJurisdiction);
+      const root = this._jurisdictionRoot(parsed.jurisdiction);
+      return this._pickDatasetInfoForRoot(this._autoDatasetsByRoot, root, this._defaultAutoDataset, parsed.domain);
     }
     _getPrimaryDatasetInfoForJurisdiction(rawJurisdiction) {
       const root = this._jurisdictionRoot(rawJurisdiction);
@@ -765,6 +959,14 @@ ${mlzBlock}` : mlzBlock;
     _getMapDatasetInfoForJurisdiction(rawJurisdiction) {
       const root = this._jurisdictionRoot(rawJurisdiction);
       return this._pickDatasetInfoForRoot(this._mapDatasetsByRoot, root, this._defaultMapDataset);
+    }
+    getAvailableAbbrevDomains() {
+      const out = {};
+      for (const [root, domains] of this._autoDomainsByRoot.entries()) {
+        if (!Array.isArray(domains) || !domains.length) continue;
+        out[root] = domains.slice();
+      }
+      return out;
     }
     normalizeKey(s) {
       return (s || "").toString().trim().toLowerCase().replace(/[“”]/g, '"').replace(/[’]/g, "'").replace(/[^a-z0-9\s\.-]/g, " ").replace(/\s+/g, " ").trim();
@@ -776,9 +978,11 @@ ${mlzBlock}` : mlzBlock;
       return { value: m[2], directive: m[1] };
     }
     lookupForCiteProc(category, key, jur, options = {}) {
-      const preferredJur = (jur || this._defaultJurisdiction || "default").toLowerCase();
+      const parsedJurisdiction = this._splitJurisdictionDomain(jur || this._defaultJurisdiction || "default");
+      const preferredJur = parsedJurisdiction.jurisdiction || (this._defaultJurisdiction || "default");
       const effectiveJur = preferredJur === "default" ? this._defaultJurisdiction || "us" : preferredJur;
-      const autoInfo = this._getAutoDatasetInfoForJurisdiction(effectiveJur) || this._getJurisdictionDatasetInfo(this._defaultAutoDataset) || { kind: "auto", dataset: this._defaultAutoDataset || "auto-us", data: this._autoUS };
+      const preferredJurWithDomain = parsedJurisdiction.domain ? `${effectiveJur}@${parsedJurisdiction.domain}` : effectiveJur;
+      const autoInfo = this._getAutoDatasetInfoForJurisdiction(preferredJurWithDomain) || this._getAutoDatasetInfoForJurisdiction(effectiveJur) || this._getJurisdictionDatasetInfo(this._defaultAutoDataset) || { kind: "auto", dataset: this._defaultAutoDataset || "auto-us", data: this._autoUS };
       const primaryData = this._primaryUS?.xdata || null;
       const primaryOverrides = this._getJurisdictionOverrideBucket(this._defaultPrimaryDataset);
       const autoOverrides = this._getJurisdictionOverrideBucket(autoInfo?.dataset);
@@ -790,27 +994,22 @@ ${mlzBlock}` : mlzBlock;
         containerTitleKeys.push(normalizedKeyNoDots);
       }
       let hit = null;
-      if (category === "institution-part") {
-        hit = lookupJurChainWithOverrides(
-          autoInfo?.data?.xdata,
-          autoOverrides,
+      if (category === "institution-part" || category === "institution-entire") {
+        hit = this._lookupInstitutionCategoryValue(
+          category,
+          key,
+          normalizedKey,
           effectiveJur,
-          "institution-part",
-          key
-        ) || lookupJurChainWithOverrides(
           autoInfo?.data?.xdata,
-          autoOverrides,
-          effectiveJur,
-          "institution-part",
-          normalizedKey
+          autoOverrides
         );
-        if (hit?.value) return { jurisdiction: hit.jurisdiction, value: hit.value };
+        if (hit?.value) return { jurisdiction: preferredJurWithDomain, value: hit.value };
         return null;
       }
       if (category === "place") {
         const upper = effectiveJur.toUpperCase();
         const value = this._lookupAutoUSPlaceOverride(upper, autoInfo?.dataset) || this._primaryJur?.xdata?.default?.place?.[upper] || autoInfo?.data?.xdata?.default?.place?.[upper] || null;
-        return value ? { jurisdiction: "default", value } : null;
+        return value ? { jurisdiction: preferredJurWithDomain, value } : null;
       }
       if (category === "container-title") {
         for (const containerTitleKey of containerTitleKeys) {
@@ -821,13 +1020,13 @@ ${mlzBlock}` : mlzBlock;
             "container-title",
             containerTitleKey
           );
-          if (hit?.value) return { jurisdiction: hit.jurisdiction || preferredJur, value: hit.value };
+          if (hit?.value) return { jurisdiction: preferredJurWithDomain, value: hit.value };
           const secondaryValue = this._lookupSecondaryContainerTitle(containerTitleKey);
           if (secondaryValue) return { jurisdiction: "default", value: secondaryValue };
         }
         if (!noHints) {
           const fallback = this.abbreviateContainerTitleFallback(key, preferredJur);
-          if (fallback) return { jurisdiction: preferredJur === "default" ? "default" : preferredJur, value: fallback };
+          if (fallback) return { jurisdiction: preferredJur === "default" ? "default" : preferredJurWithDomain, value: fallback };
         }
       }
       if (category === "title") {
@@ -838,10 +1037,10 @@ ${mlzBlock}` : mlzBlock;
           "title",
           normalizedKey
         );
-        if (hit?.value) return { jurisdiction: hit.jurisdiction || preferredJur, value: hit.value };
+        if (hit?.value) return { jurisdiction: preferredJurWithDomain, value: hit.value };
         if (!noHints) {
           const fallback = this.abbreviateTitleFallback(key, preferredJur);
-          if (fallback) return { jurisdiction: preferredJur === "default" ? "default" : preferredJur, value: fallback };
+          if (fallback) return { jurisdiction: preferredJur === "default" ? "default" : preferredJurWithDomain, value: fallback };
         }
       }
       return null;
@@ -1636,6 +1835,28 @@ ${mlzBlock}` : mlzBlock;
       const value = supplemental[normalized] || null;
       return value ? { jurisdiction: "default", value } : null;
     }
+    _lookupInstitutionCategoryValue(category, rawKey, normalizedKey, jurisdiction, xdata, overrides) {
+      const categoryName = String(category || "").trim().toLowerCase();
+      if (!categoryName || !xdata) return null;
+      const lookupKeys = [];
+      for (const candidate of [rawKey, normalizedKey]) {
+        const value = String(candidate || "").trim();
+        if (value && !lookupKeys.includes(value)) {
+          lookupKeys.push(value);
+        }
+      }
+      for (const lookupKey of lookupKeys) {
+        const hit = lookupJurChainWithOverrides(
+          xdata,
+          overrides,
+          jurisdiction,
+          categoryName,
+          lookupKey
+        );
+        if (hit?.value != null) return hit;
+      }
+      return null;
+    }
   };
   function lookupJurChainWithOverrides(xdata, overrides, jur, variable, key) {
     if (!xdata) return null;
@@ -1690,6 +1911,7 @@ ${mlzBlock}` : mlzBlock;
       this._itemPanePatchTimer = null;
       this._itemPanePatchAttempts = 0;
       this._maxItemPanePatchAttempts = 20;
+      this._commenterRowID = "ibcslm-commenter-row";
       this._jurisdictionRowID = "ibcslm-jurisdiction-row";
       this._customCourtRowID = "ibcslm-custom-court-row";
       this._syncInFlight = /* @__PURE__ */ new Set();
@@ -1783,6 +2005,7 @@ ${mlzBlock}` : mlzBlock;
       infoBox.render = function(...args) {
         const result = self._orig.infoBoxRender.apply(this, args);
         try {
+          self._renderCommenterField(this);
           self._renderJurisdictionField(this);
           self._renderCourtField(this);
           self._renderCustomCourtField(this);
@@ -1826,6 +2049,7 @@ ${mlzBlock}` : mlzBlock;
         if (this._orig.infoBoxOwner && this._orig.infoBoxRender) {
           this._orig.infoBoxOwner.render = this._orig.infoBoxRender;
         }
+        this._removeCommenterField(this._getActiveInfoBox());
         this._removeJurisdictionField(this._getActiveInfoBox());
         this._removeCustomCourtField(this._getActiveInfoBox());
       } catch (e) {
@@ -2001,6 +2225,28 @@ ${mlzBlock}` : mlzBlock;
       }
       this._updateJurisdictionRow(infoBox, row, item);
     }
+    _renderCommenterField(infoBox) {
+      const item = infoBox?.item;
+      if (!item || item.deleted) {
+        this._removeCommenterField(infoBox);
+        return;
+      }
+      const existingCommenter = this._getStoredCommenter(item);
+      if (!infoBox.editable && !existingCommenter) {
+        this._removeCommenterField(infoBox);
+        return;
+      }
+      const table = this._getInfoTable(infoBox);
+      if (!table) return;
+      const row = this._getOrCreateCommenterRow(infoBox);
+      const beforeRow = this._findCommenterAnchorRow(infoBox);
+      if (beforeRow && beforeRow.parentNode === table) {
+        table.insertBefore(row, beforeRow);
+      } else if (row.parentNode !== table) {
+        table.appendChild(row);
+      }
+      this._updateCommenterRow(infoBox, row, item, existingCommenter);
+    }
     _renderCourtField(infoBox) {
       const item = infoBox?.item;
       const itemTypeName = item ? Zotero?.ItemTypes?.getName?.(item.itemTypeID) : null;
@@ -2040,6 +2286,10 @@ ${mlzBlock}` : mlzBlock;
       const row = infoBox?.querySelector?.(`#${this._jurisdictionRowID}`);
       if (row?.parentNode) row.parentNode.removeChild(row);
     }
+    _removeCommenterField(infoBox) {
+      const row = infoBox?.querySelector?.(`#${this._commenterRowID}`);
+      if (row?.parentNode) row.parentNode.removeChild(row);
+    }
     _removeCustomCourtField(infoBox) {
       const row = infoBox?.querySelector?.(`#${this._customCourtRowID}`);
       if (row?.parentNode) row.parentNode.removeChild(row);
@@ -2076,6 +2326,34 @@ ${mlzBlock}` : mlzBlock;
         label = doc.createElement("label");
         label.id = "itembox-field-jurisdiction-label";
         label.textContent = "Jurisdiction";
+      }
+      labelWrapper.appendChild(label);
+      const dataWrapper = doc.createElement("div");
+      dataWrapper.className = "meta-data";
+      row.appendChild(labelWrapper);
+      row.appendChild(dataWrapper);
+      return row;
+    }
+    _getOrCreateCommenterRow(infoBox) {
+      let row = infoBox.querySelector(`#${this._commenterRowID}`);
+      if (row) return row;
+      const doc = infoBox.ownerDocument;
+      row = doc.createElement("div");
+      row.id = this._commenterRowID;
+      row.className = "meta-row";
+      const labelWrapper = doc.createElement("div");
+      labelWrapper.className = "meta-label";
+      labelWrapper.setAttribute("fieldname", "commenter");
+      let label;
+      if (typeof infoBox.createLabelElement === "function") {
+        label = infoBox.createLabelElement({
+          id: "itembox-field-commenter-label",
+          text: "Commenter"
+        });
+      } else {
+        label = doc.createElement("label");
+        label.id = "itembox-field-commenter-label";
+        label.textContent = "Commenter";
       }
       labelWrapper.appendChild(label);
       const dataWrapper = doc.createElement("div");
@@ -2147,6 +2425,85 @@ ${mlzBlock}` : mlzBlock;
       container.appendChild(customInput);
       container.appendChild(setButton);
       dataWrapper.appendChild(container);
+    }
+    _updateCommenterRow(infoBox, row, item, existingCommenter = null) {
+      const dataWrapper = row.querySelector(".meta-data");
+      if (!dataWrapper) return;
+      dataWrapper.textContent = "";
+      const commenter = existingCommenter || this._getStoredCommenter(item);
+      const displayValue = this._formatStoredCommenter(commenter);
+      if (infoBox.editable) {
+        const doc = row.ownerDocument;
+        const container = doc.createElement("div");
+        container.style.display = "flex";
+        container.style.alignItems = "center";
+        container.style.gap = "6px";
+        container.style.flexWrap = "wrap";
+        const input2 = doc.createElement("input");
+        input2.id = "itembox-field-commenter-input";
+        input2.className = "value";
+        input2.placeholder = "Enter commenter name";
+        input2.style.minWidth = "220px";
+        input2.style.flex = "1";
+        input2.value = displayValue;
+        const literalLabel = doc.createElement("label");
+        literalLabel.style.display = "inline-flex";
+        literalLabel.style.alignItems = "center";
+        literalLabel.style.gap = "4px";
+        literalLabel.style.whiteSpace = "nowrap";
+        const literalCheckbox = doc.createElement("input");
+        literalCheckbox.type = "checkbox";
+        literalCheckbox.checked = !!commenter?.name;
+        literalLabel.appendChild(literalCheckbox);
+        literalLabel.appendChild(doc.createTextNode("Full name"));
+        const saveCommenterValue = async () => {
+          const rawValue = String(input2.value || "").trim();
+          await this._saveCommenterFromInput(item, rawValue, literalCheckbox.checked);
+        };
+        const setButton = doc.createElement("button");
+        setButton.type = "button";
+        setButton.textContent = "Set";
+        setButton.addEventListener("click", () => {
+          saveCommenterValue();
+        });
+        input2.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          saveCommenterValue();
+        });
+        input2.addEventListener("change", () => {
+          saveCommenterValue();
+        });
+        literalCheckbox.addEventListener("change", () => {
+          saveCommenterValue();
+        });
+        container.appendChild(input2);
+        container.appendChild(literalLabel);
+        container.appendChild(setButton);
+        dataWrapper.appendChild(container);
+        return;
+      }
+      if (typeof infoBox.createValueElement === "function") {
+        const valueElem = infoBox.createValueElement({
+          editable: false,
+          text: displayValue,
+          id: "itembox-field-commenter-value",
+          attributes: {
+            "aria-labelledby": "itembox-field-commenter-label",
+            fieldname: "commenter",
+            title: displayValue
+          }
+        });
+        valueElem.value = displayValue;
+        dataWrapper.appendChild(valueElem);
+        return;
+      }
+      const input = row.ownerDocument.createElement("input");
+      input.className = "value";
+      input.readOnly = true;
+      input.value = displayValue;
+      input.title = displayValue;
+      dataWrapper.appendChild(input);
     }
     _updateJurisdictionRow(infoBox, row, item) {
       const dataWrapper = row.querySelector(".meta-data");
@@ -2270,7 +2627,16 @@ ${mlzBlock}` : mlzBlock;
       menulist.style.flex = "1";
       const popup = menulist.appendChild(doc.createXULElement("menupopup"));
       const options = this._getCourtOptions(currentJurisdiction, currentCourtKey);
-      const compoundCurrentValue = `${currentJurisdiction}||${currentCourtKey}`;
+      const hasCourt = !!String(currentCourtKey || "").trim();
+      const noEntryValue = `${currentJurisdiction}||__no_entry__`;
+      const compoundCurrentValue = hasCourt ? `${currentJurisdiction}||${currentCourtKey}` : noEntryValue;
+      if (!hasCourt) {
+        const placeholder = doc.createXULElement("menuitem");
+        placeholder.setAttribute("value", noEntryValue);
+        placeholder.setAttribute("label", "no entry");
+        placeholder.setAttribute("tooltiptext", "no entry");
+        popup.appendChild(placeholder);
+      }
       for (const option of options) {
         const menuitem = doc.createXULElement("menuitem");
         menuitem.setAttribute("value", `${option.jurisdiction}||${option.key}`);
@@ -2279,7 +2645,9 @@ ${mlzBlock}` : mlzBlock;
         popup.appendChild(menuitem);
       }
       menulist.value = compoundCurrentValue;
-      if (!menulist.selectedItem && options.length) {
+      if (!hasCourt && menulist.selectedItem) {
+        menulist.setAttribute("label", "no entry");
+      } else if (!menulist.selectedItem && options.length) {
         const fallbackIndex = options.findIndex((option) => !option.isChild && option.key === currentCourtKey && option.jurisdiction === currentJurisdiction);
         menulist.selectedIndex = fallbackIndex >= 0 ? fallbackIndex : 0;
       }
@@ -2289,6 +2657,23 @@ ${mlzBlock}` : mlzBlock;
       const saveCourtValue = async () => {
         const selectedValue = String(menulist.value || "").trim();
         if (!selectedValue) return;
+        if (selectedValue.endsWith("||__no_entry__")) {
+          const extra = String(item.getField?.("extra") || "");
+          let nextExtra = this.Jurisdiction.updateMLZExtraField?.(extra, "court", "") || extra;
+          if (nextExtra === extra && String(item.getField?.("court") || "").trim() === "") return;
+          item.setField("extra", nextExtra);
+          item.setField("court", "");
+          await item.saveTx({ skipDateModifiedUpdate: true });
+          try {
+            const infoBox2 = this._getActiveInfoBox?.();
+            if (infoBox2) {
+              this._renderCourtField(infoBox2);
+              this._renderCustomCourtField(infoBox2);
+            }
+          } catch (e) {
+          }
+          return;
+        }
         await this._saveCourtFromMenu(item, selectedValue);
       };
       menulist.addEventListener("command", saveCourtValue);
@@ -2376,23 +2761,27 @@ ${mlzBlock}` : mlzBlock;
           const row = doc.createElement("button");
           row.type = "button";
           row.textContent = option.displayText;
-          row.title = option.code;
+          row.title = option.displayText;
           row.style.display = "block";
           row.style.width = "100%";
           row.style.boxSizing = "border-box";
           row.style.textAlign = "left";
-          row.style.padding = "4px 8px";
+          row.style.padding = "2px 8px";
           row.style.border = "0";
           row.style.margin = "0";
           row.style.background = "transparent";
           row.style.color = "inherit";
+          row.style.whiteSpace = "nowrap";
+          row.style.overflow = "hidden";
+          row.style.textOverflow = "ellipsis";
+          row.style.lineHeight = "1.2";
           row.addEventListener("mousedown", (event) => {
             event.preventDefault();
             event.stopPropagation();
           });
           row.addEventListener("click", async () => {
             input.value = option.displayText;
-            input.title = option.code;
+            input.title = option.displayText;
             currentDisplayValue = option.displayText;
             currentRawValue = option.code;
             hidePopup();
@@ -2574,6 +2963,77 @@ ${mlzBlock}` : mlzBlock;
       if (!key) return "";
       return this.abbrevService.formatInstitutionPartDisplay(key, jurisdiction) || String(courtKey || "");
     }
+    _findCommenterAnchorRow(infoBox) {
+      return this._findInfoFieldRow(infoBox, "court") || this._findInfoFieldRow(infoBox, "extra") || this._findInfoFieldRow(infoBox, "date") || null;
+    }
+    _getStoredCommenter(item) {
+      const creators = this.Jurisdiction.getMLZExtraCreatorsByType?.(item, "commenter") || [];
+      return creators[0] || null;
+    }
+    _formatStoredCommenter(commenter) {
+      if (!commenter || typeof commenter !== "object") return "";
+      if (commenter.name) return String(commenter.name).trim();
+      const firstName = String(commenter.firstName || "").trim();
+      const lastName = String(commenter.lastName || "").trim();
+      return `${firstName}${firstName && lastName ? " " : ""}${lastName}`.trim();
+    }
+    _parseCommenterInput(rawValue, useLiteralName = false) {
+      const value = String(rawValue || "").trim();
+      if (!value) return null;
+      if (useLiteralName) return { name: value };
+      const commaMatch = value.match(/^([^,]+),\s*(.+)$/);
+      if (commaMatch) {
+        return {
+          firstName: String(commaMatch[2] || "").trim(),
+          lastName: String(commaMatch[1] || "").trim()
+        };
+      }
+      const parts = value.split(/\s+/).filter(Boolean);
+      if (parts.length === 1) {
+        return { name: value };
+      }
+      return {
+        firstName: parts.slice(0, -1).join(" "),
+        lastName: parts[parts.length - 1]
+      };
+    }
+    _commenterValuesEqual(a, b) {
+      const aName = String(a?.name || "").trim();
+      const bName = String(b?.name || "").trim();
+      if (aName || bName) return aName === bName;
+      return String(a?.firstName || "").trim() === String(b?.firstName || "").trim() && String(a?.lastName || "").trim() === String(b?.lastName || "").trim();
+    }
+    async _saveCommenterFromInput(item, rawValue, useLiteralName = false) {
+      try {
+        const current = this._getStoredCommenter(item);
+        const nextCommenter = this._parseCommenterInput(rawValue, useLiteralName);
+        if (!nextCommenter && !current) return;
+        if (nextCommenter && current && this._commenterValuesEqual(nextCommenter, current)) return;
+        const extra = String(item.getField?.("extra") || "");
+        const nextExtra = this.Jurisdiction.updateMLZExtraCreators?.(extra, "commenter", nextCommenter ? [nextCommenter] : []) || extra;
+        if (nextExtra === extra) return;
+        item.setField("extra", nextExtra);
+        await item.saveTx({ skipDateModifiedUpdate: true });
+        try {
+          const infoBox = this._getActiveInfoBox?.();
+          if (infoBox) this._renderCommenterField(infoBox);
+        } catch (e) {
+        }
+        try {
+          Zotero.debug(`[IndigoBook CSL-M] commenter row saved: item=${String(item.id)} value=${String(rawValue)}`);
+        } catch (e) {
+        }
+      } catch (e) {
+        try {
+          Zotero.logError(e);
+        } catch (_) {
+        }
+        try {
+          Zotero.debug(`[IndigoBook CSL-M] commenter row save failed: ${String(e)}`);
+        } catch (_) {
+        }
+      }
+    }
     async _saveJurisdictionFromMenu(item, selectedCode) {
       try {
         const current = this.Jurisdiction.getMLZJurisdiction?.(item) || "";
@@ -2723,6 +3183,7 @@ ${mlzBlock}` : mlzBlock;
     _hydrateCSLItemFromZotero(cslItem, zotItem) {
       try {
         const mlzFields = this.Jurisdiction.getMLZExtraFields?.(zotItem) || null;
+        const commenterCreators = this.Jurisdiction.getMLZExtraCreatorsByType?.(zotItem, "commenter") || [];
         if (!cslItem.title) {
           const title = zotItem.getField?.("title");
           if (title) cslItem.title = title;
@@ -2754,6 +3215,16 @@ ${mlzBlock}` : mlzBlock;
           if (court) {
             cslItem.authority = [{ literal: this.abbrevService.normalizeKey(court) || court }];
           }
+        }
+        if (!cslItem.commenter && commenterCreators.length) {
+          cslItem.commenter = commenterCreators.map((creator) => {
+            const literalName = String(creator?.name || "").trim();
+            if (literalName) return { literal: literalName };
+            return {
+              given: String(creator?.firstName || "").trim(),
+              family: String(creator?.lastName || "").trim()
+            };
+          }).filter((creator) => creator.literal || creator.given || creator.family);
         }
       } catch (e) {
         this._warnRetrieveItem(`hydrateCSLItemFromZotero failed: ${String(e)}`);
@@ -3000,6 +3471,16 @@ ${mlzBlock}` : mlzBlock;
       if (!citeproc || typeof citeproc !== "object") return citeproc;
       if (citeproc.__indigoRenderProbeInstrumented) return citeproc;
       citeproc.__indigoRenderProbeInstrumented = true;
+      try {
+        const availableAbbrevDomains = this.abbrevService?.getAvailableAbbrevDomains?.();
+        if (citeproc.opt && availableAbbrevDomains && Object.keys(availableAbbrevDomains).length) {
+          citeproc.opt.availableAbbrevDomains = {
+            ...citeproc.opt.availableAbbrevDomains || {},
+            ...availableAbbrevDomains
+          };
+        }
+      } catch (e) {
+      }
       try {
         const methodList = [
           "processCitationCluster",
