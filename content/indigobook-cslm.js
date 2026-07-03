@@ -1907,6 +1907,8 @@ ${mlzBlock}` : mlzBlock;
       this._maxShortFormLogs = 40;
       this._fieldLogCount = 0;
       this._maxFieldLogs = 40;
+      this._citationDataLogCount = 0;
+      this._maxCitationDataLogs = 80;
       this._itemObserverID = null;
       this._itemPanePatchTimer = null;
       this._itemPanePatchAttempts = 0;
@@ -3355,6 +3357,7 @@ ${mlzBlock}` : mlzBlock;
           cslItem.jurisdiction = jur;
           cslItem.country = jur.split(":")[0];
           this._decorateShortForms(cslItem, jur);
+          this._logCitationItemData(cslItem, zotItem, "retrieveItem");
           this._logRenderProbeFromItem(cslItem, jur, "retrieveItem");
         } else {
           this._logField("missing-zotero-item", `id=${String(id)}`);
@@ -3423,9 +3426,71 @@ ${mlzBlock}` : mlzBlock;
         if (!cslItem.translator && translatorCreators.length) {
           cslItem.translator = translatorCreators.map((creator) => this._extraPersonToCSLCreator(creator)).filter((creator) => creator.literal || creator.given || creator.family);
         }
+        const seeAlso = this._collectSeeAlsoURIs(cslItem, zotItem);
+        if (seeAlso.length) {
+          cslItem.seeAlso = seeAlso;
+        }
       } catch (e) {
         this._warnRetrieveItem(`hydrateCSLItemFromZotero failed: ${String(e)}`);
       }
+    }
+    _collectSeeAlsoURIs(cslItem, zotItem) {
+      const out = [];
+      const seen = /* @__PURE__ */ new Set();
+      const selfURI = this._getItemURI(zotItem);
+      const add = (value) => {
+        const normalized = this._resolveSeeAlsoEntryToURI(value, zotItem?.libraryID);
+        if (!normalized) return;
+        if (selfURI && normalized === selfURI) return;
+        if (seen.has(normalized)) return;
+        seen.add(normalized);
+        out.push(normalized);
+      };
+      try {
+        const existingSeeAlso = Array.isArray(cslItem?.seeAlso) ? cslItem.seeAlso : [];
+        for (const entry of existingSeeAlso) {
+          add(entry);
+        }
+        const relatedKeys = Array.isArray(zotItem?.relatedItems) ? zotItem.relatedItems : [];
+        for (const key of relatedKeys) {
+          const relatedItem = Zotero.Items.getByLibraryAndKey?.(zotItem.libraryID, key);
+          add(relatedItem);
+        }
+        const relatedPredicate = Zotero.Relations?.relatedItemPredicate;
+        const relatedURIs = relatedPredicate ? zotItem?.getRelationsByPredicate?.(relatedPredicate) || [] : [];
+        for (const uri of relatedURIs) {
+          add(uri);
+        }
+      } catch (e) {
+        this._warnRetrieveItem(`collectSeeAlsoURIs failed: ${String(e)}`);
+      }
+      return out;
+    }
+    _resolveSeeAlsoEntryToURI(value, libraryID = null) {
+      if (value == null) return null;
+      if (typeof value === "object") {
+        const directURI = this._getItemURI(value);
+        if (directURI) return directURI;
+        if ("key" in value && libraryID != null) {
+          const relatedItem = Zotero.Items.getByLibraryAndKey?.(libraryID, value.key);
+          return this._getItemURI(relatedItem);
+        }
+        return null;
+      }
+      const raw = String(value).trim();
+      if (!raw) return null;
+      if (/^https?:\/\/zotero\.org\//i.test(raw)) return raw;
+      if (/^\d+$/.test(raw)) return this._getItemURI(Zotero.Items.get?.(Number(raw)));
+      if (/^[A-Z0-9]{8}$/i.test(raw) && libraryID != null) return this._getItemURI(Zotero.Items.getByLibraryAndKey?.(libraryID, raw));
+      return raw;
+    }
+    _getItemURI(item) {
+      if (!item) return null;
+      try {
+        return Zotero.URI?.getItemURI?.(item) || null;
+      } catch (e) {
+      }
+      return null;
     }
     _extraPersonToCSLCreator(person) {
       const literalName = String(person?.name || "").trim();
@@ -3627,13 +3692,19 @@ ${mlzBlock}` : mlzBlock;
       const self = this;
       sysProto.loadJurisdictionStyle = function(jurisdiction, variantName) {
         const xml = self.moduleLoader.loadJurisdictionStyleSync(jurisdiction, variantName);
-        if (xml) return xml;
+        if (xml) {
+          self._logJurisdictionModuleLoad("loadJurisdictionStyle", jurisdiction, variantName, xml);
+          return xml;
+        }
         if (self._orig.loadJurisdictionStyle) return self._orig.loadJurisdictionStyle.call(this, jurisdiction, variantName);
         return null;
       };
       sysProto.retrieveStyleModule = function(jurisdiction, variantName) {
         const xml = self.moduleLoader.loadJurisdictionStyleSync(jurisdiction, variantName);
-        if (xml) return xml;
+        if (xml) {
+          self._logJurisdictionModuleLoad("retrieveStyleModule", jurisdiction, variantName, xml);
+          return xml;
+        }
         if (self._orig.retrieveStyleModule) return self._orig.retrieveStyleModule.call(this, jurisdiction, variantName);
         return null;
       };
@@ -3676,6 +3747,8 @@ ${mlzBlock}` : mlzBlock;
       if (!citeproc || typeof citeproc !== "object") return citeproc;
       if (citeproc.__indigoRenderProbeInstrumented) return citeproc;
       citeproc.__indigoRenderProbeInstrumented = true;
+      this._logCiteprocEngineDetails(citeproc);
+      this._instrumentParallelLifecycle(citeproc);
       try {
         const availableAbbrevDomains = this.abbrevService?.getAvailableAbbrevDomains?.();
         if (citeproc.opt && availableAbbrevDomains && Object.keys(availableAbbrevDomains).length) {
@@ -3698,6 +3771,7 @@ ${mlzBlock}` : mlzBlock;
         Zotero.debug(`[IndigoBook CSL-M] renderProbe citeproc instrumentation: methods=${available || "none"}`);
       } catch (e) {
       }
+      this._instrumentParallelTracker(citeproc);
       const wrap = (methodName) => {
         const orig = citeproc?.[methodName];
         if (typeof orig !== "function") return;
@@ -3722,21 +3796,119 @@ ${mlzBlock}` : mlzBlock;
       wrap("updateItems");
       return citeproc;
     }
+    _instrumentParallelLifecycle(citeproc) {
+      const wrap = (methodName) => {
+        const orig = citeproc?.[methodName];
+        if (typeof orig !== "function") return;
+        const marker = `__indigoParallelLifecycle_${methodName}`;
+        if (citeproc[marker]) return;
+        citeproc[marker] = true;
+        const self = this;
+        citeproc[methodName] = function(...args) {
+          self._logParallelLifecycle(citeproc, `${methodName}:before`, args);
+          try {
+            const result = orig.apply(this, args);
+            self._logParallelLifecycle(citeproc, `${methodName}:after`, args, result);
+            return result;
+          } catch (e) {
+            self._logParallelLifecycle(citeproc, `${methodName}:error`, args, e);
+            throw e;
+          }
+        };
+      };
+      wrap("retrieveAllStyleModules");
+      wrap("loadStyleModule");
+      wrap("buildTokenLists");
+      wrap("configureTokenList");
+    }
+    _logCiteprocEngineDetails(citeproc) {
+      try {
+        const ctorName = String(citeproc?.constructor?.name || "unknown");
+        const prefRs = Zotero.Prefs?.get?.("cite.useCiteprocRs");
+        const parallelEnabled = citeproc?.opt?.parallel?.enable;
+        const trackRepeat = Object.keys(citeproc?.opt?.track_repeat || {});
+        const hasParallelTracker = !!citeproc?.parallel;
+        const msg = `[IndigoBook CSL-M] citeproc engine: ctor=${ctorName} citeprocRsPref=${String(!!prefRs)} hasParallelTracker=${String(hasParallelTracker)} parallelEnabled=${String(!!parallelEnabled)} trackRepeat=${trackRepeat.join("|") || "none"}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
+    }
+    _logParallelLifecycle(citeproc, stage, args, resultOrError = void 0) {
+      try {
+        const parallel = citeproc?.opt?.parallel || {};
+        const trackRepeat = Object.keys(citeproc?.opt?.track_repeat || {});
+        const argSummary = this._summarizeParallelLifecycleArgs(stage, args);
+        let tail = "";
+        if (stage.endsWith(":error")) {
+          tail = ` error=${String(resultOrError)}`;
+        } else if (stage.endsWith(":after")) {
+          tail = ` result=${this._summarizeParallelLifecycleResult(resultOrError)}`;
+        }
+        const msg = `[IndigoBook CSL-M] citeproc parallel lifecycle(${stage}): enabled=${String(!!parallel.enable)} parallelKeys=${Object.keys(parallel).join("|") || "none"} trackRepeat=${trackRepeat.join("|") || "none"} ${argSummary}${tail}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
+    }
+    _summarizeParallelLifecycleArgs(stage, args) {
+      try {
+        if (stage.startsWith("retrieveAllStyleModules")) {
+          return `jurisdictions=${JSON.stringify(args?.[0] || null)}`;
+        }
+        if (stage.startsWith("loadStyleModule")) {
+          const xml = typeof args?.[1] === "string" ? args[1] : "";
+          return `jurisdiction=${String(args?.[0] || "")} hasXml=${String(!!xml)} xmlParallelAttrs=${String(/parallel-(first|last|last-to-first|delimiter-override)\s*=/.test(xml))} skipFallback=${String(!!args?.[2])}`;
+        }
+        if (stage.startsWith("buildTokenLists")) {
+          const node = args?.[0];
+          const target = args?.[1];
+          const nodeName = String(node?.name || node?.nodeName || node?.tokentype || "");
+          const targetKeys = target && typeof target === "object" ? Object.keys(target).slice(0, 6).join("|") : "none";
+          return `node=${nodeName || "unknown"} targetKeys=${targetKeys}`;
+        }
+        if (stage.startsWith("configureTokenList")) {
+          const tokens = args?.[0];
+          const tokenCount = Array.isArray(tokens) ? tokens.length : -1;
+          const tokenNames = Array.isArray(tokens) ? tokens.slice(0, 5).map((token) => String(token?.name || token?.tokentype || "")).join("|") : "none";
+          return `tokenCount=${String(tokenCount)} tokenNames=${tokenNames || "none"}`;
+        }
+      } catch (e) {
+      }
+      return "args=unavailable";
+    }
+    _summarizeParallelLifecycleResult(result) {
+      if (Array.isArray(result)) return `array(${result.length})`;
+      if (result && typeof result === "object") return `object(${Object.keys(result).slice(0, 6).join("|")})`;
+      return String(result);
+    }
+    _logJurisdictionModuleLoad(hookName, jurisdiction, variantName, xml) {
+      try {
+        const hasParallelFirst = /parallel-first\s*=/.test(xml);
+        const hasParallelLast = /parallel-last\s*=/.test(xml);
+        const hasParallelLastToFirst = /parallel-last-to-first\s*=/.test(xml);
+        const hasParallelDelimiter = /parallel-delimiter-override\s*=/.test(xml);
+        const msg = `[IndigoBook CSL-M] jurisdiction module(${hookName}): jurisdiction=${String(jurisdiction || "")} variant=${String(variantName || "")} parallel-first=${String(hasParallelFirst)} parallel-last=${String(hasParallelLast)} parallel-last-to-first=${String(hasParallelLastToFirst)} parallel-delimiter=${String(hasParallelDelimiter)}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
+    }
     _logCitationBranchProbe(methodName, citation) {
       try {
         const items = this._extractCitationItems(citation);
         if (!Array.isArray(items) || !items.length) return;
         for (const citationItem of items) {
           const itemID = citationItem?.id ?? citationItem?.itemID ?? citationItem?.itemId ?? null;
-          if (!this._isHarvardCRCLFromItemID(itemID)) continue;
           const pos = citationItem?.position;
           const nearNote = !!(citationItem?.["near-note"] || citationItem?.nearNote);
           const hasLocator = citationItem?.locator != null && String(citationItem.locator).trim() !== "";
+          const label = String(citationItem?.label || "");
           let branch = "full";
           if (pos === 2 || pos === "ibid-with-locator") branch = "ibid-with-locator";
           else if (pos === 1 || pos === "ibid") branch = "ibid";
           else if (nearNote || pos === 3 || pos === "subsequent") branch = "short";
-          const msg = `[IndigoBook CSL-M] renderProbe citeproc(${methodName}): branch=${branch} position=${String(pos)} near-note=${String(nearNote)} locator=${String(citationItem?.locator || "")} itemID=${String(itemID)}`;
+          const msg = `[IndigoBook CSL-M] renderProbe citeproc(${methodName}): branch=${branch} position=${String(pos)} near-note=${String(nearNote)} locator=${String(citationItem?.locator || "")} label=${label} has-locator=${String(hasLocator)} itemID=${String(itemID)}`;
           Zotero.debug(msg);
           Zotero.logError(msg);
         }
@@ -3756,6 +3928,7 @@ ${mlzBlock}` : mlzBlock;
     _logCiteprocMethodStart(methodName, args) {
       try {
         const items = this._extractCitationItems(args?.[0]);
+        this._logCitationRequestPayload(methodName, items, args);
         const ids = items.map((citationItem) => citationItem?.id ?? citationItem?.itemID ?? citationItem?.itemId ?? null).filter((id) => id != null).map((id) => String(id)).join(",");
         Zotero.debug(`[IndigoBook CSL-M] renderProbe citeproc start(${methodName}): args=${String(args?.length || 0)} ids=${ids || "none"}`);
       } catch (e) {
@@ -3780,15 +3953,87 @@ ${mlzBlock}` : mlzBlock;
       } catch (e) {
       }
     }
-    _isHarvardCRCLFromItemID(id) {
+    _instrumentParallelTracker(citeproc) {
       try {
-        const zotItem = this._getZoteroItemByAnyID(id);
-        if (!zotItem) return false;
-        const containerTitle = zotItem.getField?.("publicationTitle") || zotItem.getField?.("reporter") || zotItem.getField?.("report") || "";
-        return this._isHarvardCRCL(containerTitle);
+        const startCitation = citeproc?.parallel?.StartCitation;
+        if (typeof startCitation !== "function") return;
+        if (citeproc.parallel.__indigoStartCitationInstrumented) return;
+        citeproc.parallel.__indigoStartCitationInstrumented = true;
+        const self = this;
+        citeproc.parallel.StartCitation = function(...args) {
+          try {
+            self._logParallelStartCitation(args?.[0], this?.state);
+          } catch (e) {
+          }
+          return startCitation.apply(this, args);
+        };
       } catch (e) {
       }
-      return false;
+    }
+    _logCitationItemData(cslItem, zotItem, stage) {
+      if (this._citationDataLogCount >= this._maxCitationDataLogs) return;
+      this._citationDataLogCount += 1;
+      try {
+        const payload = {
+          id: cslItem?.id ?? null,
+          zoteroID: zotItem?.id ?? null,
+          key: zotItem?.key ?? null,
+          type: cslItem?.type ?? null,
+          title: cslItem?.title ?? null,
+          jurisdiction: cslItem?.jurisdiction ?? null,
+          authority: cslItem?.authority ?? null,
+          "container-title": cslItem?.["container-title"] ?? null,
+          "container-title-short": cslItem?.["container-title-short"] ?? null,
+          "title-short": cslItem?.["title-short"] ?? null,
+          seeAlso: Array.isArray(cslItem?.seeAlso) ? cslItem.seeAlso : []
+        };
+        const msg = `[IndigoBook CSL-M] citation itemData[${this._citationDataLogCount}] ${stage}: ${JSON.stringify(payload)}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
+    }
+    _logCitationRequestPayload(methodName, items, args) {
+      if (!Array.isArray(items) || !items.length) return;
+      if (this._citationDataLogCount >= this._maxCitationDataLogs) return;
+      try {
+        const payload = items.map((citationItem) => ({
+          id: citationItem?.id ?? citationItem?.itemID ?? citationItem?.itemId ?? null,
+          locator: citationItem?.locator ?? null,
+          label: citationItem?.label ?? null,
+          position: citationItem?.position ?? null,
+          "near-note": citationItem?.["near-note"] ?? citationItem?.nearNote ?? null,
+          prefix: citationItem?.prefix ?? null,
+          suffix: citationItem?.suffix ?? null
+        }));
+        const msg = `[IndigoBook CSL-M] citation request(${methodName}): items=${JSON.stringify(payload)} arg-shape=${String(args?.length || 0)}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
+    }
+    _logParallelStartCitation(sortedItems, state) {
+      if (!Array.isArray(sortedItems) || !sortedItems.length) return;
+      try {
+        const payload = sortedItems.map((entry) => ({
+          item: {
+            id: entry?.[0]?.id ?? null,
+            title: entry?.[0]?.title ?? null,
+            seeAlso: Array.isArray(entry?.[0]?.seeAlso) ? entry[0].seeAlso : []
+          },
+          citationItem: {
+            id: entry?.[1]?.id ?? entry?.[1]?.itemID ?? entry?.[1]?.itemId ?? null,
+            locator: entry?.[1]?.locator ?? null,
+            position: entry?.[1]?.position ?? null,
+            parallel: entry?.[1]?.parallel ?? null
+          }
+        }));
+        const suppressRepeats = Array.isArray(state?.tmp?.suppress_repeats) ? state.tmp.suppress_repeats : [];
+        const msg = `[IndigoBook CSL-M] parallel StartCitation: sortedItems=${JSON.stringify(payload)} suppressRepeats=${JSON.stringify(suppressRepeats)}`;
+        Zotero.debug(msg);
+        Zotero.logError(msg);
+      } catch (e) {
+      }
     }
     _getStyleXMLSync(styleObj) {
       if (styleObj._xml) return styleObj._xml;
