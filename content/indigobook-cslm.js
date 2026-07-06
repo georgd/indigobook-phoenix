@@ -4019,6 +4019,8 @@ ${mlzBlock}` : mlzBlock;
           item: {
             id: entry?.[0]?.id ?? null,
             title: entry?.[0]?.title ?? null,
+            authority: this._summarizeParallelValue(entry?.[0]?.authority),
+            number: this._summarizeParallelValue(entry?.[0]?.number),
             seeAlso: Array.isArray(entry?.[0]?.seeAlso) ? entry[0].seeAlso : []
           },
           citationItem: {
@@ -4034,6 +4036,24 @@ ${mlzBlock}` : mlzBlock;
         Zotero.logError(msg);
       } catch (e) {
       }
+    }
+    _summarizeParallelValue(value) {
+      if (value == null) return null;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return value;
+      }
+      if (Array.isArray(value)) {
+        return value.map((entry) => this._summarizeParallelValue(entry));
+      }
+      if (typeof value === "object") {
+        const out = {};
+        for (const key of ["literal", "family", "given", "name", "year"]) {
+          if (value[key] != null) out[key] = value[key];
+        }
+        if (Object.keys(out).length) return out;
+        return JSON.stringify(value);
+      }
+      return String(value);
     }
     _getStyleXMLSync(styleObj) {
       if (styleObj._xml) return styleObj._xml;
